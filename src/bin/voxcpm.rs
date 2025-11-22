@@ -3,40 +3,43 @@ use burn::backend::{self};
 use burn::module::Param;
 use burn::nn::conv::Conv1dConfig;
 use burn::prelude::*;
-use burn::record::{FullPrecisionSettings, Recorder};
+use burn::record::{BinFileRecorder, FullPrecisionSettings, HalfPrecisionSettings, JsonGzFileRecorder, PrettyJsonFileRecorder, Recorder};
 use burn::tensor::module::conv1d;
 use burn::tensor::ops::ConvOptions;
 use burn::tensor::{DType, Int, Tensor};
 use burn_import::pytorch::{LoadArgs, PyTorchFileRecorder};
+use burn_store::{ModuleSnapshot, PytorchStore};
 use tokenizers::Tokenizer;
 use voxcpm_rs::audiovae::AudioVaeConfig;
-
 
 fn main() {
     type B = backend::LibTorch<f32>;
     let device: LibTorchDevice = Default::default();
     //type B = Wgpu<f32, i32>;
 
-    let audio_vae = AudioVaeConfig::new().init(&device);
-    println!("{}", audio_vae);
+    let mut audio_vae = AudioVaeConfig::new().init(&device);
+    //println!("{}", audio_vae);
 
-    let load_args = LoadArgs::new("../VoxCPM/models/openbmb__VoxCPM-0.5B/audiovae.pth".into())
-    .with_key_remap("WNCausalConv1d", "CausalConv1d")
-    .with_top_level_key("state_dict")
-    .with_debug_print(); // Print the keys and remapped keys
+    //let load_args = LoadArgs::new("../VoxCPM/models/openbmb__VoxCPM-0.5B/audiovae.pth".into())
+    //    .with_key_remap("WNCausalConv1d", "CausalConv1d")
+    //    .with_top_level_key("state_dict");
+    //.with_debug_print(); // Print the keys and remapped keys
+    //
+    //let mut store = PytorchStore::from_file("../VoxCPM/models/openbmb__VoxCPM-0.5B/audiovae.pth")
+    //    .skip_enum_variants(true)
+    //    .with_top_level_key("state_dict");
 
-    let record = PyTorchFileRecorder::<FullPrecisionSettings>::default()
-        .load(load_args, &device)
-        .expect("Should decode state successfully");
+    //let record = PyTorchFileRecorder::<FullPrecisionSettings>::default()
+    //    .load(load_args, &device)
+    //    .expect("Should decode state successfully");
 
+    //let audio_vae = audio_vae.load_record(record);
+    //
+    //print!("{:?}", audio_vae.load_from(&mut store));
 
-    let audio_vae = audio_vae.load_record(record);
-
-    let audio: Tensor<B, 3> = Tensor::ones([1,2,3], &device);
+    let audio: Tensor<B, 3> = Tensor::ones([1, 1, 16000], &device);
 
     println!("{}", audio_vae.encode(audio, Some(16000)));
-
-
 
     //let config = MiniCPMConfig::new(
     //    1,
@@ -70,7 +73,6 @@ fn main() {
     ////let record = PyTorchFileRecorder::<FullPrecisionSettings>::default()
     ////    .load(load_args, &device)
     ////    .expect("Should decode state successfully");
-
 
     ////let base_lm = base_lm.load_record(record);
     ////println!("{:#?}", base_lm);

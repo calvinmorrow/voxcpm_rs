@@ -4,7 +4,9 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
-burn = { version = "0.19.0", features = ["wgpu", "tch"] }
-burn-import = { version = "0.19.1", features = ["pytorch"]}
+burn = { path = "../burn/crates/burn",  features = ["wgpu", "tch"] }
+burn-import = { path = "../burn/crates/burn-import", features = ["pytorch"]}
+burn-store = { path = "../burn/crates/burn-store", features = ["pytorch"]}
 hound = "3.5.1"
 tokenizers = "0.22.1"
+

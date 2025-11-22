@@ -1,23 +1,22 @@
-use std::marker::PhantomData;
-
 use burn::{
     Tensor,
     config::Config,
     module::{Module, Param},
     nn::{
-        Initializer, Tanh,
-        conv::{Conv1dConfig, ConvTranspose1d, ConvTranspose1dConfig},
+        Initializer, PaddingConfig1d, Tanh,
+        conv::{Conv1dConfig, ConvTranspose1dConfig},
     },
     prelude::Backend,
     tensor::{
+        Float,
         module::{conv_transpose1d, conv1d},
-        ops::{ConvOptions, ConvTransposeOptions},
+        ops::{ConvOptions, ConvTransposeOptions, conv::calculate_conv_padding},
     },
 };
 
 #[derive(Debug, Config)]
 pub struct AudioVaeConfig {
-    #[config(default = 123)]
+    #[config(default = 128)]
     encoder_dim: usize,
     #[config(default = "[2, 5, 8, 8]")]
     encoder_rates: [usize; 4],
@@ -48,10 +47,10 @@ impl AudioVaeConfig {
                 .with_strides(self.encoder_rates)
                 .with_depthwise(self.depthwise)
                 .init(device),
-            decoder: CausalDecoderConfig::new(latent_dim, self.decoder_dim, self.decoder_rates)
-                .with_depthwise(self.depthwise)
-                .with_use_noise_block(self.use_noise_block)
-                .init(device),
+            //decoder: CausalDecoderConfig::new(latent_dim, self.decoder_dim, self.decoder_rates)
+            //    .with_depthwise(self.depthwise)
+            //    .with_use_noise_block(self.use_noise_block)
+            //    .init(device),
             sample_rate: self.sample_rate,
             hop_length: self.encoder_rates.iter().product(),
         }
@@ -61,7 +60,7 @@ impl AudioVaeConfig {
 #[derive(Module, Debug)]
 pub struct AudioVae<B: Backend> {
     encoder: CausalEncoder<B>,
-    decoder: CausalDecoder<B>,
+    //decoder: CausalDecoder<B>,
     sample_rate: usize,
     hop_length: usize,
 }
@@ -79,7 +78,8 @@ impl<B: Backend> AudioVae<B> {
         audio_date.pad((right_pad, 0, 0, 0), 0)
     }
     pub fn decode(&self, z: Tensor<B, 3>) -> Tensor<B, 3> {
-        self.decoder.forward(z)
+        todo!()
+        //self.decoder.forward(z)
     }
 
     pub fn encode(&self, audio_data: Tensor<B, 3>, sample_rate: Option<usize>) -> Tensor<B, 3> {
@@ -109,7 +109,7 @@ impl CausalEncoderConfig {
     pub fn init<B: Backend>(&self, device: &B::Device) -> CausalEncoder<B> {
         let mut block = vec![CausalEncoderLayerType::WNCausalConv1d(
             WNCausalConv1dConfig::new(1, self.d_model, 7)
-                .with_padding(4)
+                .with_padding(3)
                 .init(device),
         )];
         let mut d_model_n = self.d_model;
@@ -160,9 +160,9 @@ impl<B: Backend> CausalEncoderLayerType<B> {
 
 #[derive(Module, Debug)]
 pub struct CausalEncoder<B: Backend> {
-    block: Vec<CausalEncoderLayerType<B>>,
     fc_mu: WNCausalConv1d<B>,
     fc_logvar: WNCausalConv1d<B>,
+    block: Vec<CausalEncoderLayerType<B>>,
 }
 
 impl<B: Backend> CausalEncoder<B> {
@@ -194,7 +194,7 @@ pub struct CausalDecoderConfig {
 
 impl CausalDecoderConfig {
     pub fn init<B: Backend>(&self, device: &B::Device) -> CausalDecoder<B> {
-        let mut layers = if self.depthwise {
+        let mut block = if self.depthwise {
             vec![
                 CausalDecoderLayerType::WNCausalConv1d(
                     WNCausalConv1dConfig::new(self.input_channel, self.input_channel, 7)
@@ -220,7 +220,7 @@ impl CausalDecoderConfig {
             output_dim = self.channels / 2usize.pow(i as u32 + 1);
             let groups = if self.depthwise { output_dim } else { 1 };
 
-            layers.push(CausalDecoderLayerType::CausalDecoderBlock(
+            block.push(CausalDecoderLayerType::CausalDecoderBlock(
                 CausalDecoderBlockConfig::new()
                     .with_input_dim(input_dim)
                     .with_output_dim(output_dim)
@@ -231,17 +231,17 @@ impl CausalDecoderConfig {
             ));
         }
 
-        layers.push(CausalDecoderLayerType::Snake1d(
+        block.push(CausalDecoderLayerType::Snake1d(
             Snake1dConfig::new(output_dim).init(device),
         ));
-        layers.push(CausalDecoderLayerType::WNCausalConv1d(
+        block.push(CausalDecoderLayerType::WNCausalConv1d(
             WNCausalConv1dConfig::new(output_dim, self.d_out, 7)
                 .with_padding(3)
                 .init(device),
         ));
-        layers.push(CausalDecoderLayerType::Tanh(Tanh::new()));
+        block.push(CausalDecoderLayerType::Tanh(Tanh::new()));
 
-        CausalDecoder { layers }
+        CausalDecoder { block }
     }
 }
 
@@ -266,12 +266,12 @@ impl<B: Backend> CausalDecoderLayerType<B> {
 
 #[derive(Module, Debug)]
 pub struct CausalDecoder<B: Backend> {
-    layers: Vec<CausalDecoderLayerType<B>>,
+    block: Vec<CausalDecoderLayerType<B>>,
 }
 
 impl<B: Backend> CausalDecoder<B> {
     pub fn forward(&self, mut x: Tensor<B, 3>) -> Tensor<B, 3> {
-        for layer in self.layers.iter() {
+        for layer in self.block.iter() {
             x = layer.forward(x);
         }
         x
@@ -436,8 +436,8 @@ impl WNCausalTransposeConv1dConfig {
 
 #[derive(Module, Debug)]
 pub struct WNCausalTransposeConv1d<B: Backend> {
-    pub weight_v: Param<Tensor<B, 3>>,
     pub weight_g: Param<Tensor<B, 3>>,
+    pub weight_v: Param<Tensor<B, 3>>,
     pub bias: Option<Param<Tensor<B, 1>>>,
     stride: usize,
     padding: usize,
@@ -495,13 +495,37 @@ pub struct WNCausalConv1dConfig {
 
 impl WNCausalConv1dConfig {
     pub fn init<B: Backend>(&self, device: &B::Device) -> WNCausalConv1d<B> {
-        let conv =
-            Conv1dConfig::new(self.channels_in, self.channels_out, self.kernel_size).init(device);
+        let conv = Conv1dConfig::new(self.channels_in, self.channels_out, self.kernel_size)
+            .with_groups(self.groups)
+            .init(device);
         let v = conv.weight.clone();
+
+        //let v = Initializer::KaimingUniform {
+        //    gain: 1.0 / 3.0f64.sqrt(),
+        //    fan_out_only: false,
+        //}
+        //.init_with(
+        //    [self.channels_out, self.channels_in, self.kernel_size],
+        //    Some(self.channels_in / self.groups * self.kernel_size),
+        //    None,
+        //    device,
+        //);
+
+        //let g = Initializer::Ones.init([self.channels_out, 1, 1], device);
+
+        //let bias = if self.bias {
+        //    Some(Initializer::Ones.init([self.channels_out], device))
+        //} else {
+        //    None
+        //};
+
         WNCausalConv1d {
             weight_v: v.clone(),
             weight_g: Param::from_tensor(v.val().powf_scalar(2.0).sum_dims(&[2, 1]).sqrt()),
             bias: if self.bias { conv.bias.clone() } else { None },
+            //weight_v: v,
+            //weight_g: g,
+            //bias,
             stride: self.stride,
             dilation: self.dilation,
             groups: self.groups,
@@ -512,8 +536,8 @@ impl WNCausalConv1dConfig {
 
 #[derive(Module, Debug)]
 pub struct WNCausalConv1d<B: Backend> {
-    pub weight_v: Param<Tensor<B, 3>>,
     pub weight_g: Param<Tensor<B, 3>>,
+    pub weight_v: Param<Tensor<B, 3>>,
     pub bias: Option<Param<Tensor<B, 1>>>,
     padding: usize,
     stride: usize,
@@ -530,14 +554,16 @@ impl<B: Backend> WNCausalConv1d<B> {
                 .powf_scalar(2.0)
                 .sum_dims(&[2, 1])
                 .sqrt();
+
         let w = self.weight_g.val() * v;
 
         let x = x.pad((self.padding * 2, 0, 0, 0), 0);
+
         conv1d(
             x,
             w,
             self.bias.clone().map(|x| x.val()),
-            ConvOptions::<1>::new([self.stride], [self.padding], [self.dilation], self.groups),
+            ConvOptions::<1>::new([self.stride], [0], [self.dilation], self.groups),
         )
     }
 }
@@ -603,7 +629,7 @@ enum CausalEncoderBlockLayerType<B: Backend> {
 }
 
 impl<B: Backend> CausalEncoderBlockLayerType<B> {
-    pub fn forward(&self, mut x: Tensor<B, 3>) -> Tensor<B, 3> {
+    pub fn forward(&self, x: Tensor<B, 3>) -> Tensor<B, 3> {
         match self {
             Self::CausalResidualUnit(val) => val.forward(x),
             Self::Snake1d(val) => val.forward(x),
@@ -645,6 +671,7 @@ impl CausalResidualUnitConfig {
             CausalResidualUnitLayerType::Snake1d(Snake1dConfig::new(self.dim).init(device)),
             CausalResidualUnitLayerType::WNCausalConv1d(
                 WNCausalConv1dConfig::new(self.dim, self.dim, self.kernel)
+                    .with_dilation(self.dilation)
                     .with_padding(pad)
                     .with_groups(self.groups)
                     .init(device),
@@ -702,6 +729,12 @@ pub struct Snake1dConfig {
 impl Snake1dConfig {
     pub fn init<B: Backend>(&self, device: &B::Device) -> Snake1d<B> {
         Snake1d {
+            id: Tensor::<B, 1>::random([10], Default::default(), device)
+                .to_data()
+                .to_vec()
+                .unwrap()
+                .iter()
+                .sum(),
             alpha: Param::from_tensor(Tensor::ones(&vec![1, self.channels, 1], device)),
         }
     }
@@ -709,6 +742,7 @@ impl Snake1dConfig {
 
 #[derive(Module, Debug)]
 pub struct Snake1d<B: Backend> {
+    id: f32,
     alpha: Param<Tensor<B, 3>>,
 }
 
