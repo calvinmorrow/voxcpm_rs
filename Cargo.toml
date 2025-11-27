@@ -9,4 +9,4 @@ burn-import = { path = "../burn/crates/burn-import", features = ["pytorch"]}
 burn-store = { path = "../burn/crates/burn-store", features = ["pytorch"]}
 hound = "3.5.1"
 tokenizers = "0.22.1"
-
+kdam = "0.6.3"

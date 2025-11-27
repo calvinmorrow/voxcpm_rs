@@ -3,14 +3,13 @@ use burn::{
     config::Config,
     module::{Module, Param},
     nn::{
-        Initializer, PaddingConfig1d, Tanh,
+        Tanh,
         conv::{Conv1dConfig, ConvTranspose1dConfig},
     },
     prelude::Backend,
     tensor::{
-        Float,
         module::{conv_transpose1d, conv1d},
-        ops::{ConvOptions, ConvTransposeOptions, conv::calculate_conv_padding},
+        ops::{ConvOptions, ConvTransposeOptions},
     },
 };
 
@@ -47,12 +46,13 @@ impl AudioVaeConfig {
                 .with_strides(self.encoder_rates)
                 .with_depthwise(self.depthwise)
                 .init(device),
-            //decoder: CausalDecoderConfig::new(latent_dim, self.decoder_dim, self.decoder_rates)
-            //    .with_depthwise(self.depthwise)
-            //    .with_use_noise_block(self.use_noise_block)
-            //    .init(device),
+            decoder: CausalDecoderConfig::new(latent_dim, self.decoder_dim, self.decoder_rates)
+                .with_depthwise(self.depthwise)
+                .with_use_noise_block(self.use_noise_block)
+                .init(device),
             sample_rate: self.sample_rate,
             hop_length: self.encoder_rates.iter().product(),
+            latent_dim,
         }
     }
 }
@@ -60,9 +60,10 @@ impl AudioVaeConfig {
 #[derive(Module, Debug)]
 pub struct AudioVae<B: Backend> {
     encoder: CausalEncoder<B>,
-    //decoder: CausalDecoder<B>,
+    decoder: CausalDecoder<B>,
     sample_rate: usize,
     hop_length: usize,
+    pub latent_dim: usize,
 }
 
 impl<B: Backend> AudioVae<B> {
@@ -78,8 +79,7 @@ impl<B: Backend> AudioVae<B> {
         audio_date.pad((right_pad, 0, 0, 0), 0)
     }
     pub fn decode(&self, z: Tensor<B, 3>) -> Tensor<B, 3> {
-        todo!()
-        //self.decoder.forward(z)
+        self.decoder.forward(z)
     }
 
     pub fn encode(&self, audio_data: Tensor<B, 3>, sample_rate: Option<usize>) -> Tensor<B, 3> {
@@ -142,7 +142,7 @@ pub struct EncoderOutput<B: Backend> {
     mu: Tensor<B, 3>,
     logvar: Tensor<B, 3>,
 }
-
+#[allow(clippy::large_enum_variant)]
 #[derive(Module, Debug)]
 enum CausalEncoderLayerType<B: Backend> {
     WNCausalConv1d(WNCausalConv1d<B>),
@@ -194,7 +194,7 @@ pub struct CausalDecoderConfig {
 
 impl CausalDecoderConfig {
     pub fn init<B: Backend>(&self, device: &B::Device) -> CausalDecoder<B> {
-        let mut block = if self.depthwise {
+        let mut model = if self.depthwise {
             vec![
                 CausalDecoderLayerType::WNCausalConv1d(
                     WNCausalConv1dConfig::new(self.input_channel, self.input_channel, 7)
@@ -220,7 +220,7 @@ impl CausalDecoderConfig {
             output_dim = self.channels / 2usize.pow(i as u32 + 1);
             let groups = if self.depthwise { output_dim } else { 1 };
 
-            block.push(CausalDecoderLayerType::CausalDecoderBlock(
+            model.push(CausalDecoderLayerType::CausalDecoderBlock(
                 CausalDecoderBlockConfig::new()
                     .with_input_dim(input_dim)
                     .with_output_dim(output_dim)
@@ -231,20 +231,21 @@ impl CausalDecoderConfig {
             ));
         }
 
-        block.push(CausalDecoderLayerType::Snake1d(
+        model.push(CausalDecoderLayerType::Snake1d(
             Snake1dConfig::new(output_dim).init(device),
         ));
-        block.push(CausalDecoderLayerType::WNCausalConv1d(
+        model.push(CausalDecoderLayerType::WNCausalConv1d(
             WNCausalConv1dConfig::new(output_dim, self.d_out, 7)
                 .with_padding(3)
                 .init(device),
         ));
-        block.push(CausalDecoderLayerType::Tanh(Tanh::new()));
+        model.push(CausalDecoderLayerType::Tanh(Tanh::new()));
 
-        CausalDecoder { block }
+        CausalDecoder { model }
     }
 }
 
+#[allow(clippy::large_enum_variant)]
 #[derive(Module, Debug)]
 enum CausalDecoderLayerType<B: Backend> {
     WNCausalConv1d(WNCausalConv1d<B>),
@@ -266,12 +267,12 @@ impl<B: Backend> CausalDecoderLayerType<B> {
 
 #[derive(Module, Debug)]
 pub struct CausalDecoder<B: Backend> {
-    block: Vec<CausalDecoderLayerType<B>>,
+    model: Vec<CausalDecoderLayerType<B>>,
 }
 
 impl<B: Backend> CausalDecoder<B> {
     pub fn forward(&self, mut x: Tensor<B, 3>) -> Tensor<B, 3> {
-        for layer in self.block.iter() {
+        for layer in self.model.iter() {
             x = layer.forward(x);
         }
         x
@@ -620,7 +621,7 @@ impl CausalEncoderBlockConfig {
         CausalEncoderBlock { block }
     }
 }
-
+#[allow(clippy::large_enum_variant)]
 #[derive(Module, Debug)]
 enum CausalEncoderBlockLayerType<B: Backend> {
     CausalResidualUnit(CausalResidualUnit<B>),
@@ -685,6 +686,7 @@ impl CausalResidualUnitConfig {
     }
 }
 
+#[allow(clippy::large_enum_variant)]
 #[derive(Module, Debug)]
 enum CausalResidualUnitLayerType<B: Backend> {
     Snake1d(Snake1d<B>),
@@ -729,12 +731,6 @@ pub struct Snake1dConfig {
 impl Snake1dConfig {
     pub fn init<B: Backend>(&self, device: &B::Device) -> Snake1d<B> {
         Snake1d {
-            id: Tensor::<B, 1>::random([10], Default::default(), device)
-                .to_data()
-                .to_vec()
-                .unwrap()
-                .iter()
-                .sum(),
             alpha: Param::from_tensor(Tensor::ones(&vec![1, self.channels, 1], device)),
         }
     }
@@ -742,7 +738,6 @@ impl Snake1dConfig {
 
 #[derive(Module, Debug)]
 pub struct Snake1d<B: Backend> {
-    id: f32,
     alpha: Param<Tensor<B, 3>>,
 }
 
