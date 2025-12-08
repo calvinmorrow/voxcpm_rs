@@ -4,9 +4,14 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
-burn = { path = "../burn/crates/burn",  features = ["wgpu", "tch"] }
+burn = { path = "../burn/crates/burn",  features = ["tch", "cpu", "ndarray", "simd" ] }
 burn-import = { path = "../burn/crates/burn-import", features = ["pytorch"]}
 burn-store = { path = "../burn/crates/burn-store", features = ["pytorch"]}
 hound = "3.5.1"
 tokenizers = "0.22.1"
 kdam = "0.6.3"
+clap = { version = "4.5.53", features = ["derive"] }
+
+#[patch.crates-io]
+#tch = { path = "../tch-rs"}
+#torch-sys = { path = "../tch-rs/torch-sys"}

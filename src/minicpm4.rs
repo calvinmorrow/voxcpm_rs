@@ -1,13 +1,14 @@
 use burn::{
-    module::Param,
     nn::{Embedding, RmsNorm, RmsNormConfig},
     prelude::*,
     tensor::{
-        FloatDType, TensorKind,
+        FloatDType,
         activation::{silu, softmax},
         linalg::outer,
     },
 };
+
+use crate::vdbg;
 
 #[derive(Debug, Config)]
 pub struct RopeScalingConfig {
@@ -68,7 +69,9 @@ impl MiniCPMConfig {
                     .init(device)
                 })
                 .collect::<Vec<_>>(),
-            norm: RmsNormConfig::new(self.hidden_size).init(device),
+            norm: MiniCPMRMSNorm {
+                inner: RmsNormConfig::new(self.hidden_size).init(device),
+            },
             rope_emb: MiniCPMLongRoPEconfig::new(
                 self.hidden_size,
                 self.num_attention_heads,
@@ -97,8 +100,8 @@ impl MiniCPMConfig {
 #[derive(Module, Debug)]
 pub struct MiniCPMModel<B: Backend> {
     pub embed_tokens: Option<Embedding<B>>,
-    layers: Vec<MiniCPMDecoderLayer<B>>,
-    norm: RmsNorm<B>,
+    pub layers: Vec<MiniCPMDecoderLayer<B>>,
+    pub norm: MiniCPMRMSNorm<B>,
     rope_emb: MiniCPMLongRoPE<B>,
     pub kv_cache: Option<StaticKVCache<B>>,
 }
@@ -109,8 +112,9 @@ impl<B: Backend> MiniCPMModel<B> {
         inputs_embeds: Tensor<B, 3>,
         is_causal: bool,
     ) -> (Tensor<B, 3>, Vec<(Tensor<B, 4>, Tensor<B, 4>)>) {
+        //vdbg!(&inputs_embeds);
         let position_ids =
-            Tensor::arange(0..inputs_embeds.dims()[1] as i64, &inputs_embeds.device()).float();
+            Tensor::arange(0..inputs_embeds.dims()[1] as i64, &inputs_embeds.device());
         let position_emb = self.rope_emb.forward(position_ids.clone().unsqueeze());
         let mut hidden_states = inputs_embeds;
 
@@ -128,8 +132,8 @@ impl<B: Backend> MiniCPMModel<B> {
         (hidden_states, next_decoder_cache)
     }
 
-    pub fn forward_step(&self, inputs_embeds: Tensor<B, 2>, position_id: usize) -> Tensor<B, 2> {
-        let kv_cache = self.kv_cache.as_ref().unwrap();
+    pub fn forward_step(&mut self, inputs_embeds: Tensor<B, 2>, position_id: usize) -> Tensor<B, 2> {
+        //vdbg!(&inputs_embeds);
 
         let position_emb = self
             .rope_emb
@@ -141,7 +145,9 @@ impl<B: Backend> MiniCPMModel<B> {
                 hidden_states,
                 position_emb.clone(),
                 position_id,
-                kv_cache.get_layer_cache(i),
+                //kv_cache.get_layer_cache(i),
+                i,
+                self.kv_cache.as_mut(),
             );
         }
 
@@ -177,12 +183,16 @@ impl MiniCPMDecoderLayerConfig {
             .with_kv_channels(self.kv_channels)
             .init(device),
             mlp: MiniCPMMLPConfig::new(self.hidden_size, self.intermediate_size).init(device),
-            input_layernorm: RmsNormConfig::new(self.hidden_size)
-                .with_epsilon(self.eps as f64)
-                .init(device),
-            post_attention_layernorm: RmsNormConfig::new(self.hidden_size)
-                .with_epsilon(self.eps as f64)
-                .init(device),
+            input_layernorm: MiniCPMRMSNorm {
+                inner: RmsNormConfig::new(self.hidden_size)
+                    .with_epsilon(self.eps as f64)
+                    .init(device),
+            },
+            post_attention_layernorm: MiniCPMRMSNorm {
+                inner: RmsNormConfig::new(self.hidden_size)
+                    .with_epsilon(self.eps as f64)
+                    .init(device),
+            },
             scale_depth: self.scale_depth,
             num_hidden_layers: self.num_hidden_layers,
             use_mup: self.use_mup,
@@ -192,10 +202,10 @@ impl MiniCPMDecoderLayerConfig {
 
 #[derive(Module, Debug)]
 pub struct MiniCPMDecoderLayer<B: Backend> {
-    self_attn: MiniCPMAttention<B>,
+    pub self_attn: MiniCPMAttention<B>,
     mlp: MiniCPMMLP<B>,
-    input_layernorm: RmsNorm<B>,
-    post_attention_layernorm: RmsNorm<B>,
+    input_layernorm: MiniCPMRMSNorm<B>,
+    post_attention_layernorm: MiniCPMRMSNorm<B>,
     scale_depth: f32,
     num_hidden_layers: usize,
     use_mup: bool,
@@ -208,6 +218,7 @@ impl<B: Backend> MiniCPMDecoderLayer<B> {
         position_emb: (Tensor<B, 2>, Tensor<B, 2>),
         is_causal: bool,
     ) -> (Tensor<B, 3>, Tensor<B, 4>, Tensor<B, 4>) {
+        //vdbg!(&hidden_states, &position_emb.0, &position_emb.1);
         let residual = hidden_states.clone();
 
         let hidden_states = self.input_layernorm.forward(hidden_states);
@@ -241,14 +252,16 @@ impl<B: Backend> MiniCPMDecoderLayer<B> {
         hidden_states: Tensor<B, 2>,
         position_emb: (Tensor<B, 2>, Tensor<B, 2>),
         position_id: usize,
-        kv_cache: (Tensor<B, 4>, Tensor<B, 4>),
+        kv_cache_index: usize,
+        kv_cache: Option<&mut StaticKVCache<B>>,
     ) -> Tensor<B, 2> {
+        //vdbg!(&hidden_states, &position_emb.0, &position_emb.1, &kv_cache.0, &kv_cache.1);
         let residual = hidden_states.clone();
         let hidden_states = self.input_layernorm.forward(hidden_states);
 
         let hidden_states =
             self.self_attn
-                .forward_step(hidden_states.clone(), position_emb, position_id, kv_cache);
+                .forward_step(hidden_states.clone(), position_emb, position_id, kv_cache_index, kv_cache);
 
         let hidden_states = if self.use_mup {
             residual + hidden_states * (self.scale_depth / (self.num_hidden_layers as f32).sqrt())
@@ -261,11 +274,13 @@ impl<B: Backend> MiniCPMDecoderLayer<B> {
         let hidden_states = self.post_attention_layernorm.forward(hidden_states);
         let hidden_states = self.mlp.forward(hidden_states);
 
-        if self.use_mup {
+        let hidden_states =if self.use_mup {
             residual + hidden_states * (self.scale_depth / (self.num_hidden_layers as f32).sqrt())
         } else {
             residual + hidden_states
-        }
+        };
+
+        hidden_states
     }
 }
 
@@ -332,6 +347,7 @@ impl<B: Backend> MiniCPMAttention<B> {
         position_emb: (Tensor<B, 2>, Tensor<B, 2>),
         is_causal: bool,
     ) -> (Tensor<B, 3>, Tensor<B, 4>, Tensor<B, 4>) {
+        //vdbg!(&hidden_states, &position_emb.0, &position_emb.1);
         let [bsz, q_len, _] = hidden_states.dims();
 
         let query_states = self.q_proj.forward(hidden_states.clone());
@@ -381,8 +397,10 @@ impl<B: Backend> MiniCPMAttention<B> {
         hidden_states: Tensor<B, 2>,
         position_emb: (Tensor<B, 2>, Tensor<B, 2>),
         position_id: usize,
-        kv_cache: (Tensor<B, 4>, Tensor<B, 4>),
+        kv_cache_index: usize,
+        mut kv_cache: Option<&mut StaticKVCache<B>>,
     ) -> Tensor<B, 2> {
+        //vdbg!(&hidden_states, &position_emb.0, &position_emb.1, &kv_cache.0, &kv_cache.1);
         let [bsz, _] = hidden_states.dims();
         let query_states = self.q_proj.forward(hidden_states.clone());
         let key_states = self.k_proj.forward(hidden_states.clone());
@@ -403,14 +421,17 @@ impl<B: Backend> MiniCPMAttention<B> {
         let (query_states, key_states) =
             Self::apply_rotary_pos_emb(query_states, key_states, cos, sin);
 
-        let (key_cache, value_cache) = kv_cache;
+        kv_cache
+            .as_mut()
+            .unwrap()
+            .append(kv_cache_index, position_id, key_states, value_states);
 
-        key_cache
-            .clone()
-            .slice_assign([s![..], s![..], s![position_id], s![..]], key_states);
-        value_cache
-            .clone()
-            .slice_assign([s![..], s![..], s![position_id], s![..]], value_states);
+        let (key_cache, value_cache) = kv_cache.as_ref().unwrap().get_layer_cache(kv_cache_index);
+
+        //key_cache
+        //    .inplace(|t| t.slice_assign([s![..], s![..], s![position_id], s![..]], key_states));
+        //value_cache
+        //    .inplace(|t| t.slice_assign([s![..], s![..], s![position_id], s![..]], value_states));
 
         let attn_mask: Tensor<B, 1, Bool> =
             Tensor::arange(0..key_cache.dims()[2] as i64, &key_cache.device())
@@ -471,18 +492,26 @@ impl<B: Backend> MiniCPMAttention<B> {
         };
 
         if enable_gqa {
-            let q_dims = query.dims();
-            let k_dims = key.dims();
-            let v_dims = value.dims();
-            key = key.repeat_dim(
-                k_dims.len() - 3,
-                q_dims[q_dims.len() - 3] / k_dims[k_dims.len() - 3],
-            );
+            let [batch, qh, _, _] = query.dims();
+            let [_, h, l, d] = key.dims();
+            //let v_dims = value.dims();
+            let reps = qh / h;
 
-            value = value.repeat_dim(
-                k_dims.len() - 3,
-                q_dims[q_dims.len() - 3] / v_dims[v_dims.len() - 3],
-            );
+            key = if reps == 1 {
+                key
+            } else {
+                key.unsqueeze_dim::<5>(2)
+                    .expand([batch, h, reps, l, d])
+                    .reshape([batch, h * reps, l, d])
+            };
+            value = if reps == 1 {
+                value
+            } else {
+                value
+                    .unsqueeze_dim::<5>(2)
+                    .expand([batch, h, reps, l, d])
+                    .reshape([batch, h * reps, l, d])
+            };
         }
 
         let k_dims_len = key.dims().len();
@@ -555,6 +584,7 @@ pub struct MiniCPMMLP<B: Backend> {
 
 impl<B: Backend> MiniCPMMLP<B> {
     pub fn forward<const D: usize>(&self, x: Tensor<B, D>) -> Tensor<B, D> {
+        //vdbg!(&x);
         self.down_proj
             .forward(silu(self.gate_proj.forward(x.clone())) * self.up_proj.forward(x))
     }
@@ -618,13 +648,11 @@ pub struct MiniCPMLongRoPE<B: Backend> {
 }
 
 impl<B: Backend> MiniCPMLongRoPE<B> {
-    pub fn forward(&self, position_ids: Tensor<B, 1>) -> (Tensor<B, 2>, Tensor<B, 2>) {
-        let cos = self
-            .cos_cached
-            .clone()
-            .select(0, position_ids.clone().int());
+    pub fn forward(&self, position_ids: Tensor<B, 1, Int>) -> (Tensor<B, 2>, Tensor<B, 2>) {
+        //vdbg!(&position_ids);
+        let cos = self.cos_cached.clone().select(0, position_ids.clone());
 
-        let sin = self.sin_cached.clone().select(0, position_ids.int());
+        let sin = self.sin_cached.clone().select(0, position_ids);
 
         (cos, sin)
     }
@@ -650,44 +678,15 @@ impl<B: Backend> MiniCPMLongRoPE<B> {
     }
 }
 
-#[derive(Debug, Config)]
-pub struct MiniCPMRMSNormConfig {
-    hidden_size: usize,
-    #[config(default = 0.1)]
-    eps: f32,
-}
-
-impl MiniCPMRMSNormConfig {
-    pub fn init<B: Backend>(&self, device: &B::Device) -> MiniCPMRMSNorm<B> {
-        MiniCPMRMSNorm {
-            weight: Param::from_tensor(Tensor::ones([self.hidden_size], device)),
-            variance_epsilon: self.eps,
-        }
-    }
-}
-
 #[derive(Module, Debug)]
 pub struct MiniCPMRMSNorm<B: Backend> {
-    weight: Param<Tensor<B, 1>>,
-    variance_epsilon: f32,
+    inner: RmsNorm<B>,
 }
 
 impl<B: Backend> MiniCPMRMSNorm<B> {
-    pub fn forward(&self, hidden_states: Tensor<B, 3>) -> Tensor<B, 3> {
-        Self::rms_layernorm(hidden_states, self.weight.val(), self.variance_epsilon)
-    }
-
-    fn rms_layernorm(hidden_states: Tensor<B, 3>, weight: Tensor<B, 1>, eps: f32) -> Tensor<B, 3> {
-        let old_dtype = hidden_states.dtype();
-        let variance = hidden_states
-            .clone()
-            .cast(FloatDType::F32)
-            .powi_scalar(2.0)
-            .mean_dim(-1);
-
-        let hidden = (hidden_states * (variance + eps).sqrt().recip()).cast(old_dtype);
-
-        hidden * weight.unsqueeze()
+    pub fn forward<const D: usize>(&self, hidden_states: Tensor<B, D>) -> Tensor<B, D> {
+        //vdbg!(&hidden_states);
+        self.inner.forward(hidden_states)
     }
 }
 
@@ -695,7 +694,7 @@ impl<B: Backend> MiniCPMRMSNorm<B> {
 pub struct StaticKVCache<B: Backend> {
     max_length: usize,
     num_layers: usize,
-    kv_cache: Tensor<B, 6>,
+    pub kv_cache: Tensor<B, 6>,
     current_length: usize,
 }
 
@@ -729,7 +728,7 @@ impl<B: Backend> StaticKVCache<B> {
     pub fn get_layer_cache(&self, layer_idx: usize) -> (Tensor<B, 4>, Tensor<B, 4>) {
         let key = self.kv_cache.clone().slice([0, layer_idx]);
         let value = self.kv_cache.clone().slice([1, layer_idx]);
-        (key.squeeze_dims(&[0,1]), value.squeeze_dims(&[0,1]))
+        (key.squeeze_dims(&[0, 1]), value.squeeze_dims(&[0, 1]))
     }
 
     pub fn step(&mut self) -> usize {
@@ -743,33 +742,72 @@ impl<B: Backend> StaticKVCache<B> {
         ret
     }
 
+    pub fn append(
+        &mut self,
+        kv_cache_index: usize,
+        position_id: usize,
+        key: Tensor<B, 4>,
+        value: Tensor<B, 4>,
+    ) {
+        self.kv_cache.inplace(|t| {
+            t.slice_assign(
+                [
+                    s![0],
+                    s![kv_cache_index],
+                    s![..],
+                    s![..],
+                    s![position_id],
+                    s![..],
+                ],
+                key.unsqueeze(),
+            )
+        });
+        self.kv_cache.inplace(|t| {
+            t.slice_assign(
+                [
+                    s![1],
+                    s![kv_cache_index],
+                    s![..],
+                    s![..],
+                    s![position_id],
+                    s![..],
+                ],
+                value.unsqueeze(),
+            )
+        });
+    }
+
     pub fn fill_cache(&mut self, kv_caches: Vec<(Tensor<B, 4>, Tensor<B, 4>)>) {
         self.current_length = kv_caches[0].0.dims()[2];
         self.kv_cache = self.kv_cache.zeros_like();
 
         for i in 0..self.num_layers {
-            self.kv_cache.clone().slice_assign(
-                [
-                    s![0],
-                    s![i],
-                    s![..],
-                    s![..],
-                    s![..self.current_length],
-                    s![..],
-                ],
-                kv_caches[i].clone().0.unsqueeze(),
-            );
-            self.kv_cache.clone().slice_assign(
-                [
-                    s![1],
-                    s![i],
-                    s![..],
-                    s![..],
-                    s![..self.current_length],
-                    s![..],
-                ],
-                kv_caches[i].clone().1.unsqueeze(),
-            );
+            self.kv_cache.inplace(|t| {
+                t.slice_assign(
+                    [
+                        s![0],
+                        s![i],
+                        s![..],
+                        s![..],
+                        s![..self.current_length],
+                        s![..],
+                    ],
+                    kv_caches[i].clone().0.unsqueeze(),
+                )
+            });
+            self.kv_cache.inplace(|t| {
+                t.slice_assign(
+                    [
+                        s![1],
+                        s![i],
+                        s![..],
+                        s![..],
+                        s![..self.current_length],
+                        s![..],
+                    ],
+                    kv_caches[i].clone().1.unsqueeze(),
+                )
+            });
         }
     }
 }

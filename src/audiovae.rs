@@ -9,9 +9,12 @@ use burn::{
     prelude::Backend,
     tensor::{
         module::{conv_transpose1d, conv1d},
-        ops::{ConvOptions, ConvTransposeOptions},
+        ops::{ConvOptions, ConvTransposeOptions, PadMode},
+        s,
     },
 };
+
+use crate::vdbg;
 
 #[derive(Debug, Config)]
 pub struct AudioVaeConfig {
@@ -76,7 +79,7 @@ impl<B: Backend> AudioVae<B> {
         let pad_to = self.hop_length;
         let length = audio_date.dims()[2];
         let right_pad = ((length as f32 / pad_to as f32).ceil()) as usize * pad_to - length;
-        audio_date.pad((right_pad, 0, 0, 0), 0)
+        audio_date.pad((right_pad, 0, 0, 0), PadMode::Constant(0.0))
     }
     pub fn decode(&self, z: Tensor<B, 3>) -> Tensor<B, 3> {
         self.decoder.forward(z)
@@ -137,6 +140,7 @@ impl CausalEncoderConfig {
     }
 }
 
+#[derive(Debug)]
 pub struct EncoderOutput<B: Backend> {
     hidden_state: Tensor<B, 3>,
     mu: Tensor<B, 3>,
@@ -151,6 +155,7 @@ enum CausalEncoderLayerType<B: Backend> {
 
 impl<B: Backend> CausalEncoderLayerType<B> {
     pub fn forward(&self, x: Tensor<B, 3>) -> Tensor<B, 3> {
+        //vdbg!(&x);
         match self {
             Self::WNCausalConv1d(val) => val.forward(x),
             Self::CausalEncoderBlock(val) => val.forward(x),
@@ -167,6 +172,7 @@ pub struct CausalEncoder<B: Backend> {
 
 impl<B: Backend> CausalEncoder<B> {
     pub fn forward(&self, mut x: Tensor<B, 3>) -> EncoderOutput<B> {
+        //vdbg!(&x);
         for layer in self.block.iter() {
             x = layer.forward(x);
         }
@@ -256,6 +262,7 @@ enum CausalDecoderLayerType<B: Backend> {
 
 impl<B: Backend> CausalDecoderLayerType<B> {
     pub fn forward(&self, x: Tensor<B, 3>) -> Tensor<B, 3> {
+        //vdbg!(&x);
         match self {
             Self::WNCausalConv1d(val) => val.forward(x),
             Self::Snake1d(val) => val.forward(x),
@@ -272,6 +279,7 @@ pub struct CausalDecoder<B: Backend> {
 
 impl<B: Backend> CausalDecoder<B> {
     pub fn forward(&self, mut x: Tensor<B, 3>) -> Tensor<B, 3> {
+        //vdbg!(&x);
         for layer in self.model.iter() {
             x = layer.forward(x);
         }
@@ -352,6 +360,7 @@ enum CausalDecoderBlockLayerType<B: Backend> {
 
 impl<B: Backend> CausalDecoderBlockLayerType<B> {
     pub fn forward(&self, x: Tensor<B, 3>) -> Tensor<B, 3> {
+        //vdbg!(&x);
         match self {
             Self::Snake1d(val) => val.forward(x),
             Self::WNCausalTransposeConv1d(val) => val.forward(x),
@@ -368,6 +377,7 @@ pub struct CausalDecoderBlock<B: Backend> {
 
 impl<B: Backend> CausalDecoderBlock<B> {
     pub fn forward(&self, mut x: Tensor<B, 3>) -> Tensor<B, 3> {
+        //vdbg!(&x);
         for layer in self.block.iter() {
             x = layer.forward(x);
         }
@@ -397,6 +407,7 @@ pub struct NoiseBlock<B: Backend> {
 
 impl<B: Backend> NoiseBlock<B> {
     pub fn forward(&self, x: Tensor<B, 3>) -> Tensor<B, 3> {
+        //vdbg!(&x);
         let [B, C, T] = x.dims();
         let noise = Tensor::random([B, 1, T], Default::default(), &x.device());
         let h = self.linear.forward(x.clone());
@@ -421,6 +432,8 @@ impl WNCausalTransposeConv1dConfig {
     pub fn init<B: Backend>(&self, device: &B::Device) -> WNCausalTransposeConv1d<B> {
         let conv = ConvTranspose1dConfig::new([self.input_dim, self.output_dim], self.kernel_size)
             .with_stride(self.stride)
+            .with_padding(self.padding)
+            .with_padding_out(self.output_padding)
             .init(device);
         let v = conv.weight.clone();
 
@@ -447,6 +460,7 @@ pub struct WNCausalTransposeConv1d<B: Backend> {
 
 impl<B: Backend> WNCausalTransposeConv1d<B> {
     pub fn forward(&self, x: Tensor<B, 3>) -> Tensor<B, 3> {
+        //vdbg!(&x);
         let v = self.weight_v.val().clone()
             / self
                 .weight_v
@@ -460,17 +474,16 @@ impl<B: Backend> WNCausalTransposeConv1d<B> {
             x,
             w,
             self.bias.clone().map(|x| x.val()),
-            ConvTransposeOptions::<1>::new(
-                [self.stride],
-                [self.padding],
-                [self.output_padding],
-                [1],
-                1,
-            ),
+            ConvTransposeOptions::<1>::new([self.stride], [0], [0], [1], 1),
         );
 
-        let r = ..(out.dims()[2] - (self.padding * 2 - self.output_padding));
-        out.slice_dim(2, r)
+        println!("{:?}", out.dims());
+
+        out.slice([
+            s![..],
+            s![..],
+            s![..-((self.padding * 2 - self.output_padding) as isize)],
+        ])
     }
 }
 
@@ -548,6 +561,7 @@ pub struct WNCausalConv1d<B: Backend> {
 
 impl<B: Backend> WNCausalConv1d<B> {
     pub fn forward(&self, x: Tensor<B, 3>) -> Tensor<B, 3> {
+        //vdbg!(&x);
         let v = self.weight_v.val().clone()
             / self
                 .weight_v
@@ -558,7 +572,7 @@ impl<B: Backend> WNCausalConv1d<B> {
 
         let w = self.weight_g.val() * v;
 
-        let x = x.pad((self.padding * 2, 0, 0, 0), 0);
+        let x = x.pad((self.padding * 2, 0, 0, 0), PadMode::Constant(0.0));
 
         conv1d(
             x,
@@ -631,6 +645,7 @@ enum CausalEncoderBlockLayerType<B: Backend> {
 
 impl<B: Backend> CausalEncoderBlockLayerType<B> {
     pub fn forward(&self, x: Tensor<B, 3>) -> Tensor<B, 3> {
+        //vdbg!(&x);
         match self {
             Self::CausalResidualUnit(val) => val.forward(x),
             Self::Snake1d(val) => val.forward(x),
@@ -646,6 +661,7 @@ pub struct CausalEncoderBlock<B: Backend> {
 
 impl<B: Backend> CausalEncoderBlock<B> {
     pub fn forward(&self, mut x: Tensor<B, 3>) -> Tensor<B, 3> {
+        //vdbg!(&x);
         for layer in self.block.iter() {
             x = layer.forward(x);
         }
@@ -695,6 +711,7 @@ enum CausalResidualUnitLayerType<B: Backend> {
 
 impl<B: Backend> CausalResidualUnitLayerType<B> {
     pub fn forward(&self, x: Tensor<B, 3>) -> Tensor<B, 3> {
+        //vdbg!(&x);
         match self {
             Self::Snake1d(val) => val.forward(x),
             Self::WNCausalConv1d(val) => val.forward(x),
@@ -709,6 +726,7 @@ pub struct CausalResidualUnit<B: Backend> {
 
 impl<B: Backend> CausalResidualUnit<B> {
     pub fn forward(&self, x: Tensor<B, 3>) -> Tensor<B, 3> {
+        //vdbg!(&x);
         let mut y = x.clone();
 
         for layer in self.block.iter() {
@@ -743,6 +761,7 @@ pub struct Snake1d<B: Backend> {
 
 impl<B: Backend> Snake1d<B> {
     pub fn forward(&self, x: Tensor<B, 3>) -> Tensor<B, 3> {
+        //vdbg!(&x);
         let alpha = self.alpha.val();
         x.clone() + (alpha.clone() + 1e-9).recip() * (alpha * x).sin().powi_scalar(2)
     }

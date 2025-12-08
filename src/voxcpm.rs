@@ -1,4 +1,4 @@
-use std::marker::PhantomData;
+use std::{marker::PhantomData, path::{Path, PathBuf}};
 
 use burn::{
     Tensor,
@@ -7,7 +7,7 @@ use burn::{
     nn::{Linear, LinearConfig},
     prelude::Backend,
     tensor::{
-        Int,
+        DType, Int,
         activation::{silu, tanh},
     },
 };
@@ -17,9 +17,18 @@ use kdam::tqdm;
 use tokenizers::Tokenizer;
 
 use crate::{
-    audiovae::{AudioVae, AudioVaeConfig},
+    audiovae::AudioVae,
     minicpm4::{MiniCPMConfig, MiniCPMModel},
+    vdbg,
 };
+
+pub fn display_tensor<const D: usize, B: Backend>(t: &Tensor<B, D>) -> String {
+    std::format!("({:?}, {:?})", t.dims(), t.dtype())
+}
+
+pub fn display_tensor_int<const D: usize, B: Backend>(t: &Tensor<B, D>) -> String {
+    std::format!("({:?}, {:?})", t.dims(), t.dtype())
+}
 
 #[derive(Debug, Config)]
 pub struct VoxCPMConfig {
@@ -74,7 +83,7 @@ impl VoxCPMConfig {
                 .encoder_config
                 .init(feat_encoder_lm_config, self.feat_dim, device),
             feat_decoder: self.dit_config.cfm_config.init(
-                MiniCPMLocDitConfig::new(self.feat_dim),
+                VoxCPMLocDiTConfig::new(self.feat_dim),
                 feat_decoder_lm_config,
                 self.feat_dim,
                 device,
@@ -114,7 +123,7 @@ impl VoxCPMConfig {
 pub struct VoxCPM<B: Backend> {
     use_mup: bool,
     scale_emb: f32,
-    patch_size: usize,
+    pub patch_size: usize,
     pub audio_start_token: usize,
     pub audio_end_token: usize,
     pub base_lm: MiniCPMModel<B>,
@@ -134,12 +143,12 @@ pub struct VoxCPM<B: Backend> {
 
 #[allow(clippy::too_many_arguments)]
 impl<B: Backend> VoxCPM<B> {
-    pub fn generate(
+    pub fn generate<AB: Backend>(
         &mut self,
         target_text: &str,
-        prompt_text: Option<&str>,
-        prompt_wav_path: Option<&str>,
-        tokenizer_path: &str,
+        prompt_text: Option<&Path>,
+        prompt_wav_path: Option<&Path>,
+        tokenizer_path: &Path,
         min_len: Option<usize>,
         max_len: Option<usize>,
         inference_timesteps: Option<usize>,
@@ -147,9 +156,10 @@ impl<B: Backend> VoxCPM<B> {
         retry_badcase: bool,                //false
         retry_badcase_max_times: usize,     //3,
         retry_badcase_ratio_threshold: f32, // 6.0,
-        audio_vae: &AudioVae<B>,
+        audio_vae: &AudioVae<AB>,
         device: &B::Device,
-    ) -> Tensor<B, 1> {
+        adevice: &AB::Device,
+    ) -> Tensor<AB, 1> {
         let text = target_text;
 
         let tokenizer = Tokenizer::from_file(tokenizer_path).unwrap();
@@ -188,27 +198,31 @@ impl<B: Backend> VoxCPM<B> {
         );
         let pred_audio_feat_len = pred_audio_feat.dims()[0];
         if pred_audio_feat_len as f32 >= target_text_length as f32 * retry_badcase_ratio_threshold {
-            panic!(
+            println!(
                 "Badcase detected, audio_text_ratio={}",
                 pred_audio_feat_len / target_text_length
             )
         }
 
+        let latent_pred: Tensor<AB, 3> =
+            Tensor::from_data(latent_pred.cast(DType::F32).to_data(), adevice);
 
         let decode_audio = audio_vae.decode(latent_pred).squeeze_dim::<2>(0);
         decode_audio.slice([s![..], s![640..-640]]).squeeze()
     }
+
     pub fn forward(
         &mut self,
-        text: Tensor<B, 2, Int>, //Tensor<B, 2>
-        text_mask: Tensor<B, 2>, //Tensor<B, 2>
-        feat: Tensor<B, 4>, //Tensor<B, 4>
-        feat_mask: Tensor<B, 2>, //Tensor<B, 2>
-        min_len: Option<usize>, //2
-        max_len: Option<usize>, //172
+        text: Tensor<B, 2, Int>,            //Tensor<B, 2>
+        text_mask: Tensor<B, 2>,            //Tensor<B, 2>
+        feat: Tensor<B, 4>,                 //Tensor<B, 4>
+        feat_mask: Tensor<B, 2>,            //Tensor<B, 2>
+        min_len: Option<usize>,             //2
+        max_len: Option<usize>,             //172
         inference_timesteps: Option<usize>, //10
-        cfg_value: Option<f32>, //1
+        cfg_value: Option<f32>,             //1
     ) -> (Tensor<B, 3>, Tensor<B, 3>) {
+        //vdbg!(&text, &text_mask, &feat, &feat_mask);
         let min_len = min_len.unwrap_or(2);
         let max_len = max_len.unwrap_or(2000);
         let inference_timesteps = inference_timesteps.unwrap_or(10);
@@ -233,7 +247,9 @@ impl<B: Backend> VoxCPM<B> {
 
         //Tensor[[1, 69, 2, 64], Float]
         //Tensor[[69, 1, 64], Float],
-        let mut prefix_feat_cond = feat.slice([s![..], s![-1], s![..], s![..]]).squeeze_dim::<3>(0); //Tensor<B, 3>
+        let mut prefix_feat_cond = feat
+            .slice([s![..], s![-1], s![..], s![..]])
+            .squeeze_dim::<3>(0); //Tensor<B, 3>
         let mut pred_feat_seq = vec![];
         let mut curr_embed;
 
@@ -245,7 +261,10 @@ impl<B: Backend> VoxCPM<B> {
         let enc_outputs = self.fsq_layer.forward(enc_outputs.clone())
             * feat_mask.clone().unsqueeze_dims(&[-1])
             + enc_outputs * text_mask.unsqueeze_dims(&[-1]); //Tensor<B, 3>
-        let mut lm_hidden: Tensor<B, 2> = enc_outputs.clone().slice([s![..], s![-1], s![..]]).squeeze_dim::<2>(0); //Tensor<B, 2>
+        let mut lm_hidden: Tensor<B, 2> = enc_outputs
+            .clone()
+            .slice([s![..], s![-1], s![..]])
+            .squeeze_dim::<2>(0); //Tensor<B, 2>
 
         let (residual_enc_outputs, residual_kv_cache_tuple) = self.residual_lm.forward(
             enc_outputs.unsqueeze() + feat_mask.unsqueeze_dims(&[-1]) * feat_embed,
@@ -256,7 +275,9 @@ impl<B: Backend> VoxCPM<B> {
             kv_cache.fill_cache(residual_kv_cache_tuple)
         }
         //residual_hidden torch.Size([1, 28, 1024]) torch.Size([1, 1024])
-        let mut residual_hidden = residual_enc_outputs.slice([s![..], s![-1], s![..]]).squeeze_dim::<2>(0); //Tensor<B,3>
+        let mut residual_hidden = residual_enc_outputs
+            .slice([s![..], s![-1], s![..]])
+            .squeeze_dim::<2>(0); //Tensor<B,3>
 
         for i in tqdm!(0..max_len) {
             let dit_hidden_1 = self.lm_to_dit_proj.forward(lm_hidden.clone()); //Tensor<B,2>
@@ -305,10 +326,13 @@ impl<B: Backend> VoxCPM<B> {
             lm_hidden = self
                 .base_lm
                 .forward_step(
-                    curr_embed.clone().slice([s![..], s![0], s![..]]).squeeze_dim::<2>(0),
+                    curr_embed
+                        .clone()
+                        .slice([s![..], s![0], s![..]])
+                        .squeeze_dim::<2>(0),
                     step,
                 )
-                .unsqueeze();//Tensor<B,2>
+                .unsqueeze(); //Tensor<B,2>
 
             lm_hidden = self.fsq_layer.forward(lm_hidden); //Tensor<B,2>
 
@@ -316,14 +340,18 @@ impl<B: Backend> VoxCPM<B> {
             residual_hidden = self
                 .residual_lm
                 .forward_step(
-                    lm_hidden.clone() + curr_embed.slice([s![..], s![0], s![..]]).squeeze_dim::<2>(0),
+                    lm_hidden.clone()
+                        + curr_embed
+                            .slice([s![..], s![0], s![..]])
+                            .squeeze_dim::<2>(0),
                     step,
                 )
                 .unsqueeze(); //Tensor<B,2>
         }
 
-        let pred_feat_seq: Tensor<B, 4> = Tensor::cat(pred_feat_seq, 1);//Tensor<B,4>
+        let pred_feat_seq: Tensor<B, 4> = Tensor::cat(pred_feat_seq, 1); //Tensor<B,4>
         let [_, t, _, d] = pred_feat_seq.dims();
+        let pred_feat_seq = pred_feat_seq.permute([0, 3, 1, 2]);
         let feat_pred = pred_feat_seq.clone().reshape([B, d, t * self.patch_size]); //Tensor<B,2>
 
         //[src/voxcpm.rs:327:9] pred_feat_seq.dims() = [ 1, 2000, 2, 64, ]
@@ -379,6 +407,7 @@ pub struct VoxCPMLocEnc<B: Backend> {
 
 impl<B: Backend> VoxCPMLocEnc<B> {
     pub fn forward(&self, x: Tensor<B, 4>) -> Tensor<B, 3> {
+        //vdbg!(&x);
         let [B, T, P, D] = x.dims();
 
         let x = self.in_proj.forward(x);
@@ -390,13 +419,14 @@ impl<B: Backend> VoxCPMLocEnc<B> {
         let [b, t, p, c] = x.dims();
         let x = x.reshape([b * t, p, c]);
 
-
         let (outputs, _) = self.encoder.forward(x.clone(), false);
 
         let cls_output = outputs.slice([s![..], s![0], s![..]]).squeeze_dim::<2>(1);
         let [bt, c] = cls_output.dims();
 
-        cls_output.reshape([b, bt / b, c])
+        let ret = cls_output.reshape([b, bt / b, c]);
+
+        ret
     }
 }
 
@@ -441,6 +471,7 @@ pub struct ScalarQuantizationLayer<B: Backend> {
 
 impl<B: Backend> ScalarQuantizationLayer<B> {
     pub fn forward<const D: usize>(&self, hidden: Tensor<B, D>) -> Tensor<B, D> {
+        //vdbg!(&hidden);
         let hidden = self.in_proj.forward(hidden);
         let hidden = tanh(hidden);
 
@@ -450,7 +481,8 @@ impl<B: Backend> ScalarQuantizationLayer<B> {
         } else {
             (hidden * self.scale as u32).round() / self.scale as u32
         };
-        self.out_proj.forward(hidden)
+        let out = self.out_proj.forward(hidden);
+        out
     }
 }
 
@@ -468,7 +500,7 @@ pub struct UnifiedCFMConfig {
 impl UnifiedCFMConfig {
     pub fn init<B: Backend>(
         &self,
-        dit_config: MiniCPMLocDitConfig,
+        dit_config: VoxCPMLocDiTConfig,
         config: MiniCPMConfig,
         in_channels: usize,
         device: &B::Device,
@@ -476,7 +508,7 @@ impl UnifiedCFMConfig {
         UnifiedCFM {
             in_channels,
             mean_mode: false,
-            estimator: MiniCPMLocDitConfig::new(in_channels).init(config, device),
+            estimator: VoxCPMLocDiTConfig::new(in_channels).init(config, device),
         }
     }
 }
@@ -485,7 +517,7 @@ impl UnifiedCFMConfig {
 pub struct UnifiedCFM<B: Backend> {
     in_channels: usize,
     mean_mode: bool,
-    estimator: MiniCPMLocDit<B>,
+    pub estimator: VoxCPMLocDiT<B>,
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -501,6 +533,7 @@ impl<B: Backend> UnifiedCFM<B> {
         sway_sampling_coef: Option<f32>,
         use_cfg_zero_star: Option<bool>,
     ) -> Tensor<B, 3> {
+        //vdbg!(&mu, &cond);
         //UnifiedCFM mu: (1, 1024), cond: (1, 64, 2)
         let temperature = temperature.unwrap_or(1.0);
         let cfg_value = cfg_value.unwrap_or(1.0);
@@ -512,15 +545,18 @@ impl<B: Backend> UnifiedCFM<B> {
         let z: Tensor<B, 3> =
             Tensor::random([b, self.in_channels, t], Default::default(), &mu.device())
                 * temperature;
+
         let t_span = Self::linespace(1.0, 0.0, (n_timesteps + 1) as u32, &mu.device());
+
         let t_span = t_span.clone()
             + sway_sampling_coef
                 * ((std::f32::consts::PI / 2.0 * t_span.clone()).cos() - 1 + t_span);
+
         //solve_euler tensor(1., dtype=torch.bfloat16) tensor(0.0469, dtype=torch.bfloat16) tensor([1.0000, 0.9531, 0.9102, 0.8516, 0.7891, 0.7070, 0.6094, 0.4922, 0.3496, 0.1885, 0.0000], dtype=torch.bfloat16)
         self.solve_euler(z, t_span, mu, cond, cfg_value, use_cfg_zero_star)
     }
 
-    fn solve_euler(
+    pub fn solve_euler(
         &self,
         mut x: Tensor<B, 3>,
         t_span: Tensor<B, 1>,
@@ -529,15 +565,8 @@ impl<B: Backend> UnifiedCFM<B> {
         cfg_value: f32,
         use_cfg_zero_star: bool,
     ) -> Tensor<B, 3> {
-        let mut t = t_span
-            .clone()
-            .select(0, Tensor::from_data([0], &mu.device()));
-        let mut dt = t_span
-            .clone()
-            .select(0, Tensor::from_data([0], &mu.device()))
-            - t_span
-                .clone()
-                .select(0, Tensor::from_data([1], &mu.device()));
+        let mut t = t_span.clone().slice([s![0]]);
+        let mut dt = t_span.clone().slice([s![0]]) - t_span.clone().slice([s![1]]);
 
         let mut sol = vec![];
         let t_span_len = t_span.dims()[0];
@@ -556,24 +585,18 @@ impl<B: Backend> UnifiedCFM<B> {
                 let t_in = Tensor::zeros([2 * b], &mu.device());
                 let mut dt_in = Tensor::zeros([2 * b], &mu.device());
                 let cond_in = Tensor::zeros([2 * b, self.in_channels, x.dims()[2]], &mu.device());
-                x_in.clone().slice_assign(s![..b], x.clone());
-                x_in.clone().slice_assign(s![b..], x.clone());
-                mu_in.clone().slice_assign(s![..b], mu.clone());
-                t_in.clone()
-                    .slice_assign(s![..b], t.clone());
-                t_in.clone()
-                    .slice_assign(s![b..], t.clone());
-                dt_in
-                    .clone()
-                    .slice_assign(s![..b], dt.clone());
-                dt_in
-                    .clone()
-                    .slice_assign(s![b..], dt.clone());
+                let x_in = x_in.clone().slice_assign([s![..b]], x.clone());
+                let x_in = x_in.clone().slice_assign([s![b..]], x.clone());
+                let mu_in = mu_in.clone().slice_assign(s![..b], mu.clone());
+                let t_in = t_in.clone().slice_assign(s![..b], t.clone());
+                let t_in = t_in.clone().slice_assign(s![b..], t.clone());
+                let dt_in = dt_in.clone().slice_assign(s![..b], dt.clone());
+                let mut dt_in = dt_in.clone().slice_assign(s![b..], dt.clone());
                 if !self.mean_mode {
                     dt_in = Tensor::zeros_like(&dt_in);
                 }
-                cond_in.clone().slice_assign(s![..b], cond.clone());
-                cond_in.clone().slice_assign(s![b..], cond.clone());
+                let cond_in = cond_in.clone().slice_assign(s![..b], cond.clone());
+                let cond_in = cond_in.clone().slice_assign(s![b..], cond.clone());
                 //VoxCPMLocDiT torch.Size([2, 64, 2]) torch.Size([2, 1024]) torch.Size([2]) torch.Size([2, 64, 2]) torch.Size([2])
                 let dphi_dt_data = self.estimator.forward(x_in, mu_in, t_in, cond_in, dt_in);
                 let data = dphi_dt_data.split(x.dims()[0], 0);
@@ -637,14 +660,14 @@ impl<B: Backend> UnifiedCFM<B> {
 }
 
 #[derive(Debug, Config)]
-pub struct MiniCPMLocDitConfig {
+pub struct VoxCPMLocDiTConfig {
     in_channels: usize,
 }
 
-impl MiniCPMLocDitConfig {
-    pub fn init<B: Backend>(&self, config: MiniCPMConfig, device: &B::Device) -> MiniCPMLocDit<B> {
+impl VoxCPMLocDiTConfig {
+    pub fn init<B: Backend>(&self, config: MiniCPMConfig, device: &B::Device) -> VoxCPMLocDiT<B> {
         let out_channels = self.in_channels;
-        MiniCPMLocDit {
+        VoxCPMLocDiT {
             in_proj: LinearConfig::new(self.in_channels, config.hidden_size)
                 .with_bias(true)
                 .init(device),
@@ -665,17 +688,17 @@ impl MiniCPMLocDitConfig {
 }
 
 #[derive(Module, Debug)]
-pub struct MiniCPMLocDit<B: Backend> {
-    in_proj: Linear<B>,
+pub struct VoxCPMLocDiT<B: Backend> {
+    pub in_proj: Linear<B>,
     cond_proj: Linear<B>,
     out_proj: Linear<B>,
-    time_embeddings: SinusoidalPosEmb<B>,
-    time_mlp: TimestepEmbedding<B>,
+    pub time_embeddings: SinusoidalPosEmb<B>,
+    pub time_mlp: TimestepEmbedding<B>,
     delta_time_mlp: TimestepEmbedding<B>,
     decoder: MiniCPMModel<B>,
 }
 
-impl<B: Backend> MiniCPMLocDit<B> {
+impl<B: Backend> VoxCPMLocDiT<B> {
     pub fn forward(
         &self,
         x: Tensor<B, 3>,
@@ -684,6 +707,7 @@ impl<B: Backend> MiniCPMLocDit<B> {
         cond: Tensor<B, 3>,
         dt: Tensor<B, 1>,
     ) -> Tensor<B, 3> {
+        //vdbg!(&x, &mu, &t, &cond, &dt);
         //VoxCPMLocDiT torch.Size([2, 64, 2]) torch.Size([2, 1024]) torch.Size([2]) torch.Size([2, 64, 2]) torch.Size([2])
         let x = self.in_proj.forward(x.swap_dims(1, 2));
         let cond = self.cond_proj.forward(cond.swap_dims(1, 2));
@@ -698,7 +722,7 @@ impl<B: Backend> MiniCPMLocDit<B> {
         let x = Tensor::cat(vec![(mu + t.unsqueeze()).unsqueeze_dim(1), cond, x], 1);
 
         let (hidden, _) = self.decoder.forward(x, false);
-        let hidden = hidden.slice([s![..], s![prefix + 1], s![..]]);
+        let hidden = hidden.slice([s![..], s![prefix + 1..], s![..]]);
         let hidden = self.out_proj.forward(hidden);
 
         //VoxCPMLocDiT x: (2, 64, 2), mu: (2, 1024), t: (2,), cond: (2, 64, 2), dt: (2,)
@@ -730,6 +754,8 @@ pub struct SinusoidalPosEmb<B: Backend> {
 
 impl<B: Backend> SinusoidalPosEmb<B> {
     pub fn forward(&self, x: Tensor<B, 1>, scale: Option<usize>) -> Tensor<B, 2> {
+        //vdbg!(&x);
+        //TODO try to remove this later and see if things break
         let scale = scale.unwrap_or(1000);
 
         let x = if x.dims().len() < 1 {
@@ -739,15 +765,17 @@ impl<B: Backend> SinusoidalPosEmb<B> {
         };
         let device = x.device();
         let half_dim = self.dim / 2;
-        let emb = (10000.0_f32).ln() / (half_dim - 1) as f32;
-        let emb = (Tensor::arange(0..half_dim as i64, &device) * -emb)
-            .float()
-            .exp();
+
+        let emb = (10000.0_f64).ln() / (half_dim - 1) as f64;
+        let emb = (Tensor::arange(0..half_dim as i64, &device).float() * -emb)
+            .exp()
+            .cast(x.dtype());
         let emb = scale as u32 * x.unsqueeze_dim::<2>(1) * emb.unsqueeze_dim::<2>(0);
 
         let e_len = emb.dims().len();
 
-        Tensor::cat(vec![emb.clone().sin(), emb.cos()], e_len - 1)
+        let emb = Tensor::cat(vec![emb.clone().sin(), emb.cos()], e_len - 1);
+        emb
     }
 }
 
@@ -764,6 +792,7 @@ impl TimestepEmbeddingConfig {
             Some(val) => val,
             None => self.time_embed_dim,
         };
+
         TimestepEmbedding {
             linear_1: LinearConfig::new(self.in_channels, self.time_embed_dim)
                 .with_bias(true)
@@ -777,15 +806,17 @@ impl TimestepEmbeddingConfig {
 
 #[derive(Module, Debug)]
 pub struct TimestepEmbedding<B: Backend> {
-    linear_1: Linear<B>,
+    pub linear_1: Linear<B>,
     //act: Silu
     linear_2: Linear<B>,
 }
 
 impl<B: Backend> TimestepEmbedding<B> {
-    pub fn forward<const D: usize>(&self, sample: Tensor<B, D>) -> Tensor<B, D> {
+    pub fn forward(&self, sample: Tensor<B, 2>) -> Tensor<B, 2> {
+        //vdbg!(&sample);
         let sample = self.linear_1.forward(sample);
         let sample = silu(sample);
-        self.linear_2.forward(sample)
+        let sample = self.linear_2.forward(sample);
+        sample
     }
 }
