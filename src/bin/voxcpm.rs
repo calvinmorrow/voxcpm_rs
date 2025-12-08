@@ -162,20 +162,14 @@ fn run(args: Args) {
         .init(&device);
 
     let mut store = BurnpackStore::from_file(model_path.join("voxcpm.bpk"));
-    println!(
-        "{:?}",
-        tts.load_from(&mut store)
-            .expect("couldn't load tts model from burnpack")
-    );
+    tts.load_from(&mut store)
+        .expect("couldn't load tts model from burnpack");
 
     let mut audio_vae: AudioVae<B> = AudioVaeConfig::new().init(&device);
     let mut store = BurnpackStore::from_file(model_path.join("audiovae.bpk"));
-    println!(
-        "{:?}",
-        audio_vae
-            .load_from(&mut store)
-            .expect("couldn't load audio_vae model from burnpack")
-    );
+    audio_vae
+        .load_from(&mut store)
+        .expect("couldn't load audio_vae model from burnpack");
 
     let wav = tts.generate(
         target_text

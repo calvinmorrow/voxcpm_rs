@@ -477,8 +477,6 @@ impl<B: Backend> WNCausalTransposeConv1d<B> {
             ConvTransposeOptions::<1>::new([self.stride], [0], [0], [1], 1),
         );
 
-        println!("{:?}", out.dims());
-
         out.slice([
             s![..],
             s![..],
