@@ -1,4 +1,4 @@
-This is rust(using [burn-rs](https://github.com/tracel-ai/burn)) implementation of [VoxCPM](https://github.com/OpenBMB/VoxCPM).
+This is rust (using [burn-rs](https://github.com/tracel-ai/burn)) implementation of [VoxCPM](https://github.com/OpenBMB/VoxCPM).
 
 # How to use
 
