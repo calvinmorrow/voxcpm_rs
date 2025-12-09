@@ -56,6 +56,7 @@ impl AudioVaeConfig {
             sample_rate: self.sample_rate,
             hop_length: self.encoder_rates.iter().product(),
             latent_dim,
+            chunk_size: self.encoder_rates.iter().product(),
         }
     }
 }
@@ -64,9 +65,10 @@ impl AudioVaeConfig {
 pub struct AudioVae<B: Backend> {
     encoder: CausalEncoder<B>,
     decoder: CausalDecoder<B>,
-    sample_rate: usize,
+    pub sample_rate: usize,
     hop_length: usize,
     pub latent_dim: usize,
+    pub chunk_size: usize,
 }
 
 impl<B: Backend> AudioVae<B> {

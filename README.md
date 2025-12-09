@@ -7,7 +7,7 @@ Build `voxcpm-rs`. You have to use the development version of burn-rs.
 ```bash
 git clone https://github.com/tracel-ai/burn
 cd burn
-git checkout bd695bd7504ecddc4e550b162bff8025feda58be
+git checkout e0847cbf618395775bf534cbece9f0c7f0d897be
 cd ..
 git clone https://github.com/madushan1000/voxcpm_rs
 cd voxcpm_rs
@@ -25,6 +25,21 @@ cargo run --release --bin voxcpm convert --input-path ../VoxCPM-0.5B/ --output-p
 Run it.
 
 ```bash
-cargo run --release --bin voxcpm run --model-path burn-models/ --target-text 'VoxCPM is an innovative end-to-end TTS model from ModelBest, designed to generate highly expressive speech.'
+cargo run --release --bin voxcpm run --model-path burn-models/ \
+          --target-text 'VoxCPM is an innovative end-to-end TTS model from ModelBest, designed to generate highly expressive speech.'
 mpv output.wav
 ```
+
+Or.
+
+```bash
+cargo run --release --bin voxcpm run --model-path burn-models/ \
+            --max-len 200 \
+            --target-text 'VoxCPM is an innovative end-to-end TTS model from ModelBest, designed to generate highly expressive speech.' \
+            --prompt-text "Having complete focus on a recipe and not allowing yourself to be distracted by your thoughts, can have a therapeutic effect." \
+            --prompt-wav-path voices/en_US_joe.wav
+mpv output.wav
+
+```
+
+The example voice is from [OHF-Voice](https://github.com/OHF-Voice/voice-datasets) public domain voice dataset.

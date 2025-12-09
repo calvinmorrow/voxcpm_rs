@@ -4,8 +4,8 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
-burn = { path = "../burn/crates/burn",  features = ["tch", "cpu", "ndarray", "simd" ] }
-burn-import = { path = "../burn/crates/burn-import", features = ["pytorch"]}
+#burn = { path = "../burn/crates/burn",  features = ["tch", "cpu", "candle"] }
+burn = { path = "../burn/crates/burn", features = ["tch", "fusion"] }
 burn-store = { path = "../burn/crates/burn-store", features = ["pytorch"]}
 hound = "3.5.1"
 tokenizers = "0.22.1"

@@ -1,4 +1,4 @@
-use std::{marker::PhantomData, path::{Path, PathBuf}};
+use std::{marker::PhantomData, path::Path};
 
 use burn::{
     Tensor,
@@ -9,6 +9,7 @@ use burn::{
     tensor::{
         DType, Int,
         activation::{silu, tanh},
+        ops::PadMode,
     },
 };
 
@@ -146,8 +147,7 @@ impl<B: Backend> VoxCPM<B> {
     pub fn generate<AB: Backend>(
         &mut self,
         target_text: &str,
-        prompt_text: Option<&Path>,
-        prompt_wav_path: Option<&Path>,
+        prompt: Option<(String, Tensor<AB, 2>)>,
         tokenizer_path: &Path,
         min_len: Option<usize>,
         max_len: Option<usize>,
@@ -160,31 +160,106 @@ impl<B: Backend> VoxCPM<B> {
         device: &B::Device,
         adevice: &AB::Device,
     ) -> Tensor<AB, 1> {
-        let text = target_text;
-
         let tokenizer = Tokenizer::from_file(tokenizer_path).unwrap();
-        let text_token = tokenizer.encode(text, false).unwrap();
-        let target_text_length = text_token.get_ids().len();
-        let text_token: Tensor<B, 1, Int> = Tensor::from_data(text_token.get_ids(), device);
-        let text_token = Tensor::cat(
-            vec![
-                text_token,
-                Tensor::from_data([self.audio_start_token], device),
-            ],
-            0,
-        );
+        let text_token_in;
+        let text_mask_in;
+        let audio_feat_in;
+        let audio_mask_in;
+        let target_text_length;
+        if let Some((prompt_text, mut prompt_audio)) = prompt {
+            let text = prompt_text.to_string() + target_text;
+            let text_token = tokenizer.encode(text, false).unwrap();
+            target_text_length = text_token.get_ids().len();
+            let text_token: Tensor<B, 1, Int> = Tensor::from_data(text_token.get_ids(), device);
+            let text_token = Tensor::cat(
+                vec![
+                    text_token,
+                    Tensor::from_data([self.audio_start_token], device),
+                ],
+                0,
+            );
+            let text_length = text_token.dims()[0];
+            //TODO take mean
+            //TODO resample
+            let patch_len = self.patch_size * audio_vae.chunk_size;
+            let pad_size = prompt_audio.dims()[1] % patch_len;
+            if pad_size != 0 {
+                prompt_audio = Tensor::pad(
+                    prompt_audio,
+                    (0, patch_len - pad_size, 0, 0),
+                    PadMode::Constant(0.0),
+                );
+            }
 
-        let text_length = text_token.dims()[0];
+            let audio_feat =
+                audio_vae.encode(prompt_audio.unsqueeze(), Some(audio_vae.sample_rate));
 
-        let audio_feat: Tensor<B, 3> =
-            Tensor::zeros([text_length, self.patch_size, audio_vae.latent_dim], device);
-        let text_mask: Tensor<B, 1> = Tensor::ones([text_length], device);
-        let audio_mask: Tensor<B, 1> = Tensor::zeros([text_length], device);
+            let audio_feat = audio_feat
+                .reshape([audio_vae.latent_dim as i64, -1, self.patch_size as i64])
+                .permute([1, 2, 0]);
 
-        let text_token = text_token.unsqueeze_dim(0);
-        let text_mask = text_mask.unsqueeze();
-        let audio_feat = audio_feat.unsqueeze_dim(0);
-        let audio_mask = audio_mask.unsqueeze();
+            let audio_feat = audio_feat.slice([s![..-1], s![..], s![..]]);
+            let audio_feat = Tensor::from(audio_feat.to_data());
+            let audio_length = audio_feat.dims()[0];
+            let text_pad_token = Tensor::zeros([audio_length], device);
+
+            let text_token = Tensor::cat(vec![text_token, text_pad_token], 0);
+
+            let audio_pad_feat =
+                Tensor::zeros([text_length, self.patch_size, audio_vae.latent_dim], device);
+
+            let audio_feat = Tensor::cat(vec![audio_pad_feat, audio_feat], 0);
+
+            let text_mask = Tensor::cat(
+                vec![
+                    Tensor::ones([text_length], device),
+                    Tensor::zeros([audio_length], device),
+                ],
+                0,
+            );
+
+            let audio_mask = Tensor::cat(
+                vec![
+                    Tensor::zeros([text_length], device),
+                    Tensor::ones([audio_length], device),
+                ],
+                0,
+            );
+
+            text_token_in = text_token;
+            text_mask_in = text_mask;
+            audio_feat_in = audio_feat;
+            audio_mask_in = audio_mask;
+        } else {
+            let text = target_text;
+            let text_token = tokenizer.encode(text, false).unwrap();
+            target_text_length = text_token.get_ids().len();
+            let text_token: Tensor<B, 1, Int> = Tensor::from_data(text_token.get_ids(), device);
+            let text_token = Tensor::cat(
+                vec![
+                    text_token,
+                    Tensor::from_data([self.audio_start_token], device),
+                ],
+                0,
+            );
+
+            let text_length = text_token.dims()[0];
+
+            let audio_feat: Tensor<B, 3> =
+                Tensor::zeros([text_length, self.patch_size, audio_vae.latent_dim], device);
+            let text_mask: Tensor<B, 1> = Tensor::ones([text_length], device);
+            let audio_mask: Tensor<B, 1> = Tensor::zeros([text_length], device);
+
+            text_token_in = text_token;
+            text_mask_in = text_mask;
+            audio_feat_in = audio_feat;
+            audio_mask_in = audio_mask;
+        }
+
+        let text_token = text_token_in.unsqueeze_dim(0);
+        let text_mask = text_mask_in.unsqueeze();
+        let audio_feat = audio_feat_in.unsqueeze_dim(0);
+        let audio_mask = audio_mask_in.unsqueeze();
 
         let (latent_pred, pred_audio_feat) = self.forward(
             text_token,
@@ -583,11 +658,15 @@ impl<B: Backend> UnifiedCFM<B> {
                 let x_in = Tensor::zeros([2 * b, self.in_channels, x.dims()[2]], &mu.device());
                 let mu_in = Tensor::zeros([2 * b, mu.dims()[1]], &mu.device());
                 let t_in = Tensor::zeros([2 * b], &mu.device());
-                let mut dt_in = Tensor::zeros([2 * b], &mu.device());
+                let dt_in = Tensor::zeros([2 * b], &mu.device());
                 let cond_in = Tensor::zeros([2 * b, self.in_channels, x.dims()[2]], &mu.device());
-                let x_in = x_in.clone().slice_assign([s![..b]], x.clone());
-                let x_in = x_in.clone().slice_assign([s![b..]], x.clone());
-                let mu_in = mu_in.clone().slice_assign(s![..b], mu.clone());
+                let x_in = x_in
+                    .clone()
+                    .slice_assign([s![..b], s![..], s![..]], x.clone());
+                let x_in = x_in
+                    .clone()
+                    .slice_assign([s![b..], s![..], s![..]], x.clone());
+                let mu_in = mu_in.clone().slice_assign([s![..b], s![..]], mu.clone());
                 let t_in = t_in.clone().slice_assign(s![..b], t.clone());
                 let t_in = t_in.clone().slice_assign(s![b..], t.clone());
                 let dt_in = dt_in.clone().slice_assign(s![..b], dt.clone());
@@ -595,8 +674,12 @@ impl<B: Backend> UnifiedCFM<B> {
                 if !self.mean_mode {
                     dt_in = Tensor::zeros_like(&dt_in);
                 }
-                let cond_in = cond_in.clone().slice_assign(s![..b], cond.clone());
-                let cond_in = cond_in.clone().slice_assign(s![b..], cond.clone());
+                let cond_in = cond_in
+                    .clone()
+                    .slice_assign([s![..b], s![..], s![..]], cond.clone());
+                let cond_in = cond_in
+                    .clone()
+                    .slice_assign([s![b..], s![..], s![..]], cond.clone());
                 //VoxCPMLocDiT torch.Size([2, 64, 2]) torch.Size([2, 1024]) torch.Size([2]) torch.Size([2, 64, 2]) torch.Size([2])
                 let dphi_dt_data = self.estimator.forward(x_in, mu_in, t_in, cond_in, dt_in);
                 let data = dphi_dt_data.split(x.dims()[0], 0);
