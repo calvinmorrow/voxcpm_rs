@@ -14,26 +14,22 @@ use burn::{
     },
 };
 
-use crate::vdbg;
-
 #[derive(Debug, Config)]
 pub struct AudioVaeConfig {
-    #[config(default = 128)]
+    #[config(default = 64)]
     encoder_dim: usize,
-    #[config(default = "[2, 5, 8, 8]")]
-    encoder_rates: [usize; 4],
+    #[config(default = "vec![2, 3, 6, 7, 7]")]
+    encoder_rates: Vec<usize>,
     #[config(default = "Some(64)")]
     latent_dim: Option<usize>,
-    #[config(default = 1536)]
+    #[config(default = 2048)]
     decoder_dim: usize,
-    #[config(default = "[8, 8, 5, 2]")]
-    decoder_rates: [usize; 4],
-    #[config(default = true)]
-    depthwise: bool,
-    #[config(default = 16000)]
+    #[config(default = "vec![7, 7, 6, 3, 2]")]
+    decoder_rates: Vec<usize>,
+    depthwise: Option<bool>,
+    #[config(default = 44100)]
     sample_rate: usize,
-    #[config(default = false)]
-    use_noise_block: bool,
+    use_noise_block: Option<bool>,
 }
 
 impl AudioVaeConfig {
@@ -42,17 +38,23 @@ impl AudioVaeConfig {
             Some(val) => val,
             None => self.encoder_dim * (2usize.pow(self.encoder_rates.len() as u32)),
         };
+        let depthwise = self.depthwise.unwrap_or(true);
+        let use_noise_block = self.use_noise_block.unwrap_or(false);
         AudioVae {
             encoder: CausalEncoderConfig::new()
                 .with_d_model(self.encoder_dim)
                 .with_latent_dim(latent_dim)
-                .with_strides(self.encoder_rates)
-                .with_depthwise(self.depthwise)
+                .with_strides(self.encoder_rates.clone())
+                .with_depthwise(depthwise)
                 .init(device),
-            decoder: CausalDecoderConfig::new(latent_dim, self.decoder_dim, self.decoder_rates)
-                .with_depthwise(self.depthwise)
-                .with_use_noise_block(self.use_noise_block)
-                .init(device),
+            decoder: CausalDecoderConfig::new(
+                latent_dim,
+                self.decoder_dim,
+                self.decoder_rates.clone(),
+            )
+            .with_depthwise(depthwise)
+            .with_use_noise_block(use_noise_block)
+            .init(device),
             sample_rate: self.sample_rate,
             hop_length: self.encoder_rates.iter().product(),
             latent_dim,
@@ -73,7 +75,7 @@ pub struct AudioVae<B: Backend> {
 
 impl<B: Backend> AudioVae<B> {
     pub fn preprocess(&self, audio_date: Tensor<B, 3>, sample_rate: Option<usize>) -> Tensor<B, 3> {
-        let sample_rate = match sample_rate {
+        let _sample_rate = match sample_rate {
             Some(val) => val,
             None => self.sample_rate,
         };
@@ -104,8 +106,8 @@ pub struct CausalEncoderConfig {
     d_model: usize,
     #[config(default = 32)]
     latent_dim: usize,
-    #[config(default = "[2, 4, 8, 8]")]
-    strides: [usize; 4],
+    #[config(default = "vec![2, 3, 6, 7, 7]")]
+    strides: Vec<usize>,
     #[config(default = false)]
     depthwise: bool,
 }
@@ -118,7 +120,7 @@ impl CausalEncoderConfig {
                 .init(device),
         )];
         let mut d_model_n = self.d_model;
-        for stride in self.strides {
+        for &stride in self.strides.iter() {
             d_model_n *= 2;
             let groups = if self.depthwise { d_model_n / 2 } else { 1 };
             block.push(CausalEncoderLayerType::CausalEncoderBlock(
@@ -143,6 +145,7 @@ impl CausalEncoderConfig {
 }
 
 #[derive(Debug)]
+#[allow(dead_code)]
 pub struct EncoderOutput<B: Backend> {
     hidden_state: Tensor<B, 3>,
     mu: Tensor<B, 3>,
@@ -191,7 +194,7 @@ impl<B: Backend> CausalEncoder<B> {
 pub struct CausalDecoderConfig {
     input_channel: usize,
     channels: usize,
-    rates: [usize; 4],
+    rates: Vec<usize>,
     #[config(default = "false")]
     depthwise: bool,
     #[config(default = 1)]
@@ -410,8 +413,8 @@ pub struct NoiseBlock<B: Backend> {
 impl<B: Backend> NoiseBlock<B> {
     pub fn forward(&self, x: Tensor<B, 3>) -> Tensor<B, 3> {
         //vdbg!(&x);
-        let [B, C, T] = x.dims();
-        let noise = Tensor::random([B, 1, T], Default::default(), &x.device());
+        let [b, _c, t] = x.dims();
+        let noise = Tensor::random([b, 1, t], Default::default(), &x.device());
         let h = self.linear.forward(x.clone());
         let n = noise * h;
         x + n

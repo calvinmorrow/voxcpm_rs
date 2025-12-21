@@ -14,12 +14,15 @@ cd voxcpm_rs
 cargo build --release
 cd ..
 ```
-Download the model weights and convert them.
+Download the VoxCPM1.5 weights (safetensors) and convert them. The converter expects
+`model.safetensors`, `audiovae.pth`, `config.json`, and `tokenizer.json` in the input directory
+and applies the PyTorch-compatible safetensors adapter during import.
 
 ```bash
-git clone https://huggingface.co/openbmb/VoxCPM-0.5B
+git clone https://huggingface.co/openbmb/VoxCPM1.5
+ln -s ../VoxCPM1.5 model
 cd voxcpm_rs
-cargo run --release --bin voxcpm convert --input-path ../VoxCPM-0.5B/ --output-path burn-models/
+cargo run --release --bin voxcpm convert --input-path model/ --output-path burn-models/
 ```
 
 Run it.

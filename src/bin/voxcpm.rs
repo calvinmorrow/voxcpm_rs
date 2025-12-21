@@ -4,13 +4,18 @@ use burn::backend::libtorch::LibTorchDevice;
 use burn::backend::{self};
 use burn::prelude::*;
 use burn::tensor::DType;
-use burn_store::pytorch::PytorchReader;
-use burn_store::{BurnpackStore, ModuleSnapshot, PytorchStore};
+use burn_store::{
+    BurnpackStore,
+    ModuleSnapshot,
+    PyTorchToBurnAdapter,
+    PytorchStore,
+    SafetensorsStore,
+};
 
 use burn::tensor::{PrintOptions, set_print_options};
 use clap::Parser;
 use hound::{Sample, SampleFormat, WavReader, WavSpec};
-use voxcpm_rs::audiovae::{AudioVae, AudioVaeConfig};
+use voxcpm_rs::audiovae::AudioVae;
 use voxcpm_rs::voxcpm::{VoxCPM, VoxCPMConfig};
 
 #[derive(Parser, Debug)]
@@ -100,15 +105,14 @@ fn run(args: Args) {
 
     let model_path = Path::new(&model_path);
 
-    let mut tts: VoxCPM<B> = VoxCPMConfig::load(model_path.join("config.json"))
-        .unwrap()
-        .init(&device);
+    let tts_config = VoxCPMConfig::load(model_path.join("config.json")).unwrap();
+    let mut tts: VoxCPM<B> = tts_config.init(&device);
 
     let mut store = BurnpackStore::from_file(model_path.join("voxcpm.bpk"));
     tts.load_from(&mut store)
         .expect("couldn't load tts model from burnpack");
 
-    let mut audio_vae: AudioVae<B> = AudioVaeConfig::new().init(&device);
+    let mut audio_vae: AudioVae<B> = tts_config.audio_vae_config.init(&device);
     let mut store = BurnpackStore::from_file(model_path.join("audiovae.bpk"));
     audio_vae
         .load_from(&mut store)
@@ -163,10 +167,10 @@ fn read_wav(path: &str) -> Vec<f32> {
     match reader.spec() {
         WavSpec {
             channels: 2,
-            sample_rate: 16000,
+            sample_rate,
             sample_format: SampleFormat::Float,
             ..
-        } => {
+        } if sample_rate == 16000 || sample_rate == 44100 => {
             let data: Vec<_> = reader.samples::<f32>().collect();
             data[..]
                 .windows(2)
@@ -175,16 +179,18 @@ fn read_wav(path: &str) -> Vec<f32> {
         }
         WavSpec {
             channels: 1,
-            sample_rate: 16000,
+            sample_rate,
             sample_format: SampleFormat::Float,
             ..
-        } => reader.samples::<f32>().map(|s| s.unwrap()).collect(),
+        } if sample_rate == 16000 || sample_rate == 44100 => {
+            reader.samples::<f32>().map(|s| s.unwrap()).collect()
+        }
         WavSpec {
             channels: 2,
-            sample_rate: 16000,
+            sample_rate,
             sample_format: SampleFormat::Int,
             ..
-        } => {
+        } if sample_rate == 16000 || sample_rate == 44100 => {
             let data: Vec<_> = reader.samples::<i16>().collect();
             data[..]
                 .chunks(2)
@@ -199,14 +205,14 @@ fn read_wav(path: &str) -> Vec<f32> {
         }
         WavSpec {
             channels: 1,
-            sample_rate: 16000,
+            sample_rate,
             sample_format: SampleFormat::Int,
             ..
-        } => reader
+        } if sample_rate == 16000 || sample_rate == 44100 => reader
             .samples::<i16>()
             .map(|s| (s.unwrap().as_i16() as f32 / i16::MAX as f32).clamp(-1.0, 1.0))
             .collect(),
-        _ => panic!("only 16000Hz prompt audio is supported"),
+        _ => panic!("only 16000Hz or 44100Hz prompt audio is supported"),
     }
 }
 
@@ -236,17 +242,19 @@ fn convert(input_path: &str, output_path: &str) {
     }
     type B = backend::LibTorch<f32>;
     let device: LibTorchDevice = Default::default();
-    let mut tts: VoxCPM<B> = VoxCPMConfig::load(input_path.join("config.json"))
-        .expect("couldn't load pytorch model config")
-        .init(&device);
-    let mut store = PytorchStore::from_file(input_path.join("pytorch_model.bin"))
+    let tts_config =
+        VoxCPMConfig::load(input_path.join("config.json")).expect("couldn't load model config");
+    let mut tts: VoxCPM<B> = tts_config.init(&device);
+    let mut store = SafetensorsStore::from_file(input_path.join("model.safetensors"))
+        .with_from_adapter(PyTorchToBurnAdapter)
+        .map_indices_contiguous(true)
         .skip_enum_variants(true)
-        .with_key_remapping("norm.weight", "norm.inner.gamma")
-        .with_top_level_key("state_dict");
+        .with_key_remapping("norm.weight", "norm.inner.gamma");
+    println!("Loading TTS model tensors...");
     println!(
         "{:?}",
         tts.load_from(&mut store)
-            .expect("couldn't load pytorch tts model")
+            .expect("couldn't load safetensors tts model")
     );
     let mut store = BurnpackStore::from_file(output_path.join("voxcpm.bpk")).overwrite(true);
     println!(
@@ -255,11 +263,12 @@ fn convert(input_path: &str, output_path: &str) {
             .expect("couldn't save tts model to burnpack")
     );
 
-    let mut audio_vae: AudioVae<B> = AudioVaeConfig::new().init(&device);
+    let mut audio_vae: AudioVae<B> = tts_config.audio_vae_config.init(&device);
     let mut store = PytorchStore::from_file(input_path.join("audiovae.pth"))
         .skip_enum_variants(true)
         .validate(false)
         .with_top_level_key("state_dict");
+    println!("Loading Audio VAE tensors...");
     println!(
         "{:?}",
         audio_vae
@@ -284,10 +293,4 @@ fn convert(input_path: &str, output_path: &str) {
         output_path.join("tokenizer.json"),
     )
     .expect("couldn't copy tokenizer config");
-}
-
-fn load_tensor<const D: usize, B: Backend>(path: &str) -> Tensor<B, D> {
-    let s = PytorchReader::new(path).unwrap();
-    println!("{:?}", s.metadata());
-    Tensor::<B, D>::from(s.get("val").unwrap().to_data().unwrap())
 }

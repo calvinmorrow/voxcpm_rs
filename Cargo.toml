@@ -6,11 +6,12 @@ edition = "2024"
 [dependencies]
 #burn = { path = "../burn/crates/burn",  features = ["tch", "cpu", "candle"] }
 burn = { path = "../burn/crates/burn", features = ["tch", "fusion"] }
-burn-store = { path = "../burn/crates/burn-store", features = ["pytorch"]}
+burn-store = { path = "../burn/crates/burn-store", features = ["pytorch", "safetensors"]}
 hound = "3.5.1"
 tokenizers = "0.22.1"
 kdam = "0.6.3"
 clap = { version = "4.5.53", features = ["derive"] }
+serde = { version = "1.0.228", features = ["derive"] }
 
 #[patch.crates-io]
 #tch = { path = "../tch-rs"}

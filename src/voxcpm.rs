@@ -18,9 +18,8 @@ use kdam::tqdm;
 use tokenizers::Tokenizer;
 
 use crate::{
-    audiovae::AudioVae,
+    audiovae::{AudioVae, AudioVaeConfig},
     minicpm4::{MiniCPMConfig, MiniCPMModel},
-    vdbg,
 };
 
 pub fn display_tensor<const D: usize, B: Backend>(t: &Tensor<B, D>) -> String {
@@ -46,6 +45,7 @@ pub struct VoxCPMConfig {
     pub scalar_quantization_scale: usize,
     pub encoder_config: VoxCPMLocEncConfig,
     pub dit_config: VoxCPMDitConfig,
+    pub audio_vae_config: AudioVaeConfig,
     #[config(default = 4096)]
     pub max_length: usize,
 }
@@ -153,8 +153,8 @@ impl<B: Backend> VoxCPM<B> {
         max_len: Option<usize>,
         inference_timesteps: Option<usize>,
         cfg_value: Option<f32>,
-        retry_badcase: bool,                //false
-        retry_badcase_max_times: usize,     //3,
+        _retry_badcase: bool,                //false
+        _retry_badcase_max_times: usize,     //3,
         retry_badcase_ratio_threshold: f32, // 6.0,
         audio_vae: &AudioVae<AB>,
         device: &B::Device,
@@ -303,8 +303,6 @@ impl<B: Backend> VoxCPM<B> {
         let inference_timesteps = inference_timesteps.unwrap_or(10);
         let cfg_value = cfg_value.unwrap_or(2.0);
 
-        let [B, T, P, D] = feat.dims();
-
         let feat_embed = self.feat_encoder.forward(feat.clone()); //Tensor<B, 3>
         let feat_embed = self.enc_to_lm_proj.forward(feat_embed.clone()); //Tensor<B, 3>
 
@@ -425,9 +423,11 @@ impl<B: Backend> VoxCPM<B> {
         }
 
         let pred_feat_seq: Tensor<B, 4> = Tensor::cat(pred_feat_seq, 1); //Tensor<B,4>
-        let [_, t, _, d] = pred_feat_seq.dims();
+        let [b, t, _, d] = pred_feat_seq.dims();
         let pred_feat_seq = pred_feat_seq.permute([0, 3, 1, 2]);
-        let feat_pred = pred_feat_seq.clone().reshape([B, d, t * self.patch_size]); //Tensor<B,2>
+        let feat_pred = pred_feat_seq
+            .clone()
+            .reshape([b, d, t * self.patch_size]); //Tensor<B,2>
 
         //[src/voxcpm.rs:327:9] pred_feat_seq.dims() = [ 1, 2000, 2, 64, ]
         //pred_feat_seq torch.Size([1, 84, 2, 64])
@@ -483,13 +483,13 @@ pub struct VoxCPMLocEnc<B: Backend> {
 impl<B: Backend> VoxCPMLocEnc<B> {
     pub fn forward(&self, x: Tensor<B, 4>) -> Tensor<B, 3> {
         //vdbg!(&x);
-        let [B, T, P, D] = x.dims();
+        let [b, t, _p, _d] = x.dims();
 
         let x = self.in_proj.forward(x);
         let special_tokens =
             self.special_token
                 .val()
-                .expand([B, T, 1, self.special_token.val().dims()[3]]);
+                .expand([b, t, 1, self.special_token.val().dims()[3]]);
         let x = Tensor::cat(vec![special_tokens, x], 2);
         let [b, t, p, c] = x.dims();
         let x = x.reshape([b * t, p, c]);
@@ -575,7 +575,7 @@ pub struct UnifiedCFMConfig {
 impl UnifiedCFMConfig {
     pub fn init<B: Backend>(
         &self,
-        dit_config: VoxCPMLocDiTConfig,
+        _dit_config: VoxCPMLocDiTConfig,
         config: MiniCPMConfig,
         in_channels: usize,
         device: &B::Device,
@@ -615,7 +615,7 @@ impl<B: Backend> UnifiedCFM<B> {
         let sway_sampling_coef = sway_sampling_coef.unwrap_or(1.0);
         let use_cfg_zero_star = use_cfg_zero_star.unwrap_or(true);
 
-        let [b, c] = mu.dims();
+        let [b, _c] = mu.dims();
         let t = patch_size;
         let z: Tensor<B, 3> =
             Tensor::random([b, self.in_channels, t], Default::default(), &mu.device())
