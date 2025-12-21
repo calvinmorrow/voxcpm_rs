@@ -469,16 +469,16 @@ impl<B: Backend> MiniCPMAttention<B> {
     ) -> Tensor<B, 4> {
         let device = &query.device();
         let q_dims = query.dims();
-        let l = q_dims[q_dims.len() - 2];
+        let query_len = q_dims[q_dims.len() - 2];
         let k_dims = key.dims();
-        let s = k_dims[k_dims.len() - 2];
+        let key_len = k_dims[k_dims.len() - 2];
 
         let scale_factor = scale.unwrap_or(1.0 / (q_dims[q_dims.len() - 1] as f32).sqrt());
-        let attn_bias: Tensor<B, 2> = Tensor::zeros([l, s], device);
+        let attn_bias: Tensor<B, 2> = Tensor::zeros([query_len, key_len], device);
 
         let attn_bias = if is_causal {
             assert!(attn_mask.is_none());
-            let temp_mask: Tensor<B, _, Int> = Tensor::ones([l, s], device).tril(0);
+            let temp_mask: Tensor<B, _, Int> = Tensor::ones([query_len, key_len], device).tril(0);
             attn_bias.mask_fill(temp_mask.bool().bool_not(), f32::NEG_INFINITY)
         } else {
             attn_bias

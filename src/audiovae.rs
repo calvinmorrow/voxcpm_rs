@@ -145,7 +145,7 @@ impl CausalEncoderConfig {
 }
 
 #[derive(Debug)]
-#[allow(dead_code)]
+#[allow(dead_code)] // Keep debug fields for inspection; some are not used in current inference path.
 pub struct EncoderOutput<B: Backend> {
     hidden_state: Tensor<B, 3>,
     mu: Tensor<B, 3>,
@@ -413,8 +413,8 @@ pub struct NoiseBlock<B: Backend> {
 impl<B: Backend> NoiseBlock<B> {
     pub fn forward(&self, x: Tensor<B, 3>) -> Tensor<B, 3> {
         //vdbg!(&x);
-        let [b, _c, t] = x.dims();
-        let noise = Tensor::random([b, 1, t], Default::default(), &x.device());
+        let [batch_size, _channels, time_steps] = x.dims();
+        let noise = Tensor::random([batch_size, 1, time_steps], Default::default(), &x.device());
         let h = self.linear.forward(x.clone());
         let n = noise * h;
         x + n

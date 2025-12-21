@@ -483,13 +483,13 @@ pub struct VoxCPMLocEnc<B: Backend> {
 impl<B: Backend> VoxCPMLocEnc<B> {
     pub fn forward(&self, x: Tensor<B, 4>) -> Tensor<B, 3> {
         //vdbg!(&x);
-        let [b, t, _p, _d] = x.dims();
+        let [batch_size, time_steps, _patches, _channels] = x.dims();
 
         let x = self.in_proj.forward(x);
         let special_tokens =
             self.special_token
                 .val()
-                .expand([b, t, 1, self.special_token.val().dims()[3]]);
+                .expand([batch_size, time_steps, 1, self.special_token.val().dims()[3]]);
         let x = Tensor::cat(vec![special_tokens, x], 2);
         let [b, t, p, c] = x.dims();
         let x = x.reshape([b * t, p, c]);
@@ -615,10 +615,10 @@ impl<B: Backend> UnifiedCFM<B> {
         let sway_sampling_coef = sway_sampling_coef.unwrap_or(1.0);
         let use_cfg_zero_star = use_cfg_zero_star.unwrap_or(true);
 
-        let [b, _c] = mu.dims();
+        let [batch_size, _channels] = mu.dims();
         let t = patch_size;
         let z: Tensor<B, 3> =
-            Tensor::random([b, self.in_channels, t], Default::default(), &mu.device())
+            Tensor::random([batch_size, self.in_channels, t], Default::default(), &mu.device())
                 * temperature;
 
         let t_span = Self::linespace(1.0, 0.0, (n_timesteps + 1) as u32, &mu.device());
