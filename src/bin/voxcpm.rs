@@ -3,7 +3,7 @@ use std::path::Path;
 use burn::backend::libtorch::LibTorchDevice;
 use burn::backend::{self};
 use burn::prelude::*;
-use burn::tensor::DType;
+use burn::tensor::{DType, bf16};
 use burn_store::{
     BurnpackStore,
     ModuleSnapshot,
@@ -100,19 +100,21 @@ fn run(args: Args) {
         ),
     };
 
-    type B = backend::LibTorch<f32>;
-    let device: LibTorchDevice = Default::default();
+    type BTts = backend::LibTorch<bf16>;
+    type BAud = backend::LibTorch<f32>;
+    let tts_device: LibTorchDevice = Default::default();
+    let audio_device: LibTorchDevice = Default::default();
 
     let model_path = Path::new(&model_path);
 
     let tts_config = VoxCPMConfig::load(model_path.join("config.json")).unwrap();
-    let mut tts: VoxCPM<B> = tts_config.init(&device);
+    let mut tts: VoxCPM<BTts> = tts_config.init(&tts_device);
 
     let mut store = BurnpackStore::from_file(model_path.join("voxcpm.bpk"));
     tts.load_from(&mut store)
         .expect("couldn't load tts model from burnpack");
 
-    let mut audio_vae: AudioVae<B> = tts_config.audio_vae_config.init(&device);
+    let mut audio_vae: AudioVae<BAud> = tts_config.audio_vae_config.init(&audio_device);
     let mut store = BurnpackStore::from_file(model_path.join("audiovae.bpk"));
     audio_vae
         .load_from(&mut store)
@@ -121,7 +123,8 @@ fn run(args: Args) {
     let prompt = match (prompt_text, prompt_wav_path) {
         (Some(prompt_text), Some(prompt_wav_path)) => Some((
             prompt_text,
-            Tensor::<B, 1>::from_floats(&read_wav(&prompt_wav_path)[..], &device).unsqueeze(),
+            Tensor::<BAud, 1>::from_floats(&read_wav(&prompt_wav_path)[..], &audio_device)
+                .unsqueeze(),
         )),
         (None, None) => None,
         _ => panic!("provide none or both prompt text and prompt audio"),
@@ -141,15 +144,15 @@ fn run(args: Args) {
         retry_badcase_max_times.unwrap_or(3),
         retry_badcase_ratio_threshold.unwrap_or(6.0),
         &audio_vae,
-        &device,
-        &device,
+        &tts_device,
+        &audio_device,
     );
 
     let wav: Vec<f32> = wav.cast(DType::F32).to_data().to_vec().unwrap();
 
     let spec = hound::WavSpec {
         channels: 1,
-        sample_rate: 16000,
+        sample_rate: audio_vae.sample_rate as u32,
         bits_per_sample: 16,
         sample_format: hound::SampleFormat::Int,
     };
@@ -240,11 +243,13 @@ fn convert(input_path: &str, output_path: &str) {
     if !output_path.exists() {
         std::fs::create_dir(output_path).expect("couldn't create output path");
     }
-    type B = backend::LibTorch<f32>;
-    let device: LibTorchDevice = Default::default();
+    type BTts = backend::LibTorch<bf16>;
+    type BAud = backend::LibTorch<f32>;
+    let tts_device: LibTorchDevice = Default::default();
+    let audio_device: LibTorchDevice = Default::default();
     let tts_config =
         VoxCPMConfig::load(input_path.join("config.json")).expect("couldn't load model config");
-    let mut tts: VoxCPM<B> = tts_config.init(&device);
+    let mut tts: VoxCPM<BTts> = tts_config.init(&tts_device);
     let mut store = SafetensorsStore::from_file(input_path.join("model.safetensors"))
         .with_from_adapter(PyTorchToBurnAdapter)
         .map_indices_contiguous(true)
@@ -263,7 +268,7 @@ fn convert(input_path: &str, output_path: &str) {
             .expect("couldn't save tts model to burnpack")
     );
 
-    let mut audio_vae: AudioVae<B> = tts_config.audio_vae_config.init(&device);
+    let mut audio_vae: AudioVae<BAud> = tts_config.audio_vae_config.init(&audio_device);
     let mut store = PytorchStore::from_file(input_path.join("audiovae.pth"))
         .skip_enum_variants(true)
         .validate(false)
