@@ -7,13 +7,15 @@ use burn::{
     nn::{Linear, LinearConfig},
     prelude::Backend,
     tensor::{
-        DType, Int,
+        DType, Distribution, Int, bf16,
         activation::{silu, tanh},
         ops::PadMode,
     },
 };
 
 use burn::prelude::*;
+use burn::tensor::TensorPrimitive;
+use burn::backend;
 use kdam::tqdm;
 use tokenizers::Tokenizer;
 
@@ -153,13 +155,57 @@ impl<B: Backend> VoxCPM<B> {
         max_len: Option<usize>,
         inference_timesteps: Option<usize>,
         cfg_value: Option<f32>,
-        _retry_badcase: bool,                //false
-        _retry_badcase_max_times: usize,     //3,
+        retry_badcase: bool,                //false
+        retry_badcase_max_times: usize,     //3,
         retry_badcase_ratio_threshold: f32, // 6.0,
+        _debug: bool,
+        _stop_on_zero: bool,
         audio_vae: &AudioVae<AB>,
         device: &B::Device,
         adevice: &AB::Device,
     ) -> Tensor<AB, 1> {
+        let latent_pred = self.generate_latent(
+            target_text,
+            prompt,
+            tokenizer_path,
+            min_len,
+            max_len,
+            inference_timesteps,
+            cfg_value,
+            retry_badcase,
+            retry_badcase_max_times,
+            retry_badcase_ratio_threshold,
+            _debug,
+            _stop_on_zero,
+            audio_vae,
+            device,
+            adevice,
+        );
+        let latent_pred: Tensor<AB, 3> =
+            Tensor::from_data(latent_pred.cast(DType::F32).to_data(), adevice);
+
+        let decode_audio = audio_vae.decode(latent_pred).squeeze_dim::<2>(0);
+        decode_audio.slice([s![..], s![640..-640]]).squeeze()
+    }
+
+    fn generate_latent<AB: Backend>(
+        &mut self,
+        target_text: &str,
+        prompt: Option<(String, Tensor<AB, 2>)>,
+        tokenizer_path: &Path,
+        min_len: Option<usize>,
+        max_len: Option<usize>,
+        inference_timesteps: Option<usize>,
+        cfg_value: Option<f32>,
+        retry_badcase: bool,
+        retry_badcase_max_times: usize,
+        retry_badcase_ratio_threshold: f32,
+        _debug: bool,
+        _stop_on_zero: bool,
+        audio_vae: &AudioVae<AB>,
+        device: &B::Device,
+        _adevice: &AB::Device,
+    ) -> Tensor<B, 3> {
         let tokenizer = Tokenizer::from_file(tokenizer_path).unwrap();
         let text_token_in;
         let text_mask_in;
@@ -168,9 +214,11 @@ impl<B: Backend> VoxCPM<B> {
         let target_text_length;
         if let Some((prompt_text, mut prompt_audio)) = prompt {
             let text = prompt_text.to_string() + target_text;
-            let text_token = tokenizer.encode(text, false).unwrap();
-            target_text_length = text_token.get_ids().len();
-            let text_token: Tensor<B, 1, Int> = Tensor::from_data(text_token.get_ids(), device);
+            let text_token_ids = tokenize_masked(&tokenizer, &text);
+            let text_token_ids: Vec<usize> =
+                text_token_ids.into_iter().map(|id| id as usize).collect();
+            let text_token: Tensor<B, 1, Int> =
+                Tensor::from_data(text_token_ids.as_slice(), device);
             let text_token = Tensor::cat(
                 vec![
                     text_token,
@@ -199,9 +247,12 @@ impl<B: Backend> VoxCPM<B> {
                 .permute([1, 2, 0]);
 
             let audio_feat = audio_feat.slice([s![..-1], s![..], s![..]]);
-            let audio_feat = Tensor::from(audio_feat.to_data());
+            let audio_feat = Tensor::<B, 3>::from_data(
+                audio_feat.to_data().convert_dtype(DType::BF16),
+                device,
+            );
             let audio_length = audio_feat.dims()[0];
-            let text_pad_token = Tensor::zeros([audio_length], device);
+            let text_pad_token: Tensor<B, 1, Int> = Tensor::zeros([audio_length], device);
 
             let text_token = Tensor::cat(vec![text_token, text_pad_token], 0);
 
@@ -212,16 +263,16 @@ impl<B: Backend> VoxCPM<B> {
 
             let text_mask = Tensor::cat(
                 vec![
-                    Tensor::ones([text_length], device),
-                    Tensor::zeros([audio_length], device),
+                    Tensor::<B, 1, Int>::ones([text_length], device),
+                    Tensor::<B, 1, Int>::zeros([audio_length], device),
                 ],
                 0,
             );
 
             let audio_mask = Tensor::cat(
                 vec![
-                    Tensor::zeros([text_length], device),
-                    Tensor::ones([audio_length], device),
+                    Tensor::<B, 1, Int>::zeros([text_length], device),
+                    Tensor::<B, 1, Int>::ones([audio_length], device),
                 ],
                 0,
             );
@@ -232,9 +283,11 @@ impl<B: Backend> VoxCPM<B> {
             audio_mask_in = audio_mask;
         } else {
             let text = target_text;
-            let text_token = tokenizer.encode(text, false).unwrap();
-            target_text_length = text_token.get_ids().len();
-            let text_token: Tensor<B, 1, Int> = Tensor::from_data(text_token.get_ids(), device);
+            let text_token_ids = tokenize_masked(&tokenizer, text);
+            let text_token_ids: Vec<usize> =
+                text_token_ids.into_iter().map(|id| id as usize).collect();
+            let text_token: Tensor<B, 1, Int> =
+                Tensor::from_data(text_token_ids.as_slice(), device);
             let text_token = Tensor::cat(
                 vec![
                     text_token,
@@ -247,8 +300,8 @@ impl<B: Backend> VoxCPM<B> {
 
             let audio_feat: Tensor<B, 3> =
                 Tensor::zeros([text_length, self.patch_size, audio_vae.latent_dim], device);
-            let text_mask: Tensor<B, 1> = Tensor::ones([text_length], device);
-            let audio_mask: Tensor<B, 1> = Tensor::zeros([text_length], device);
+            let text_mask: Tensor<B, 1, Int> = Tensor::<B, 1, Int>::ones([text_length], device);
+            let audio_mask: Tensor<B, 1, Int> = Tensor::<B, 1, Int>::zeros([text_length], device);
 
             text_token_in = text_token;
             text_mask_in = text_mask;
@@ -256,46 +309,57 @@ impl<B: Backend> VoxCPM<B> {
             audio_mask_in = audio_mask;
         }
 
+        target_text_length = tokenize_masked(&tokenizer, target_text).len();
         let text_token = text_token_in.unsqueeze_dim(0);
         let text_mask = text_mask_in.unsqueeze();
         let audio_feat = audio_feat_in.unsqueeze_dim(0);
         let audio_mask = audio_mask_in.unsqueeze();
 
-        let (latent_pred, pred_audio_feat) = self.forward(
-            text_token,
-            text_mask,
-            audio_feat,
-            audio_mask,
-            min_len,
-            max_len,
-            inference_timesteps,
-            cfg_value,
-        );
-        let pred_audio_feat_len = pred_audio_feat.dims()[0];
-        if pred_audio_feat_len as f32 >= target_text_length as f32 * retry_badcase_ratio_threshold {
-            println!(
-                "Badcase detected, audio_text_ratio={}",
-                pred_audio_feat_len / target_text_length
-            )
+        let max_len = max_len.unwrap_or(2000);
+        let max_len = ((target_text_length as f32 * retry_badcase_ratio_threshold).round() as usize + 10)
+            .min(max_len);
+        let mut retry_times = 0usize;
+        loop {
+            let (latent_pred, pred_audio_feat) = self.forward(
+                text_token.clone(),
+                text_mask.clone(),
+                audio_feat.clone(),
+                audio_mask.clone(),
+                min_len,
+                Some(max_len),
+                inference_timesteps,
+                cfg_value,
+                false,
+                false,
+            );
+            let pred_audio_feat_len = pred_audio_feat.dims()[0];
+            let ratio = pred_audio_feat_len as f32 / target_text_length as f32;
+            if pred_audio_feat_len as f32 >= target_text_length as f32 * retry_badcase_ratio_threshold
+            {
+                println!("Badcase detected, audio_text_ratio={}", ratio);
+            }
+            if retry_badcase && retry_times < retry_badcase_max_times {
+                if ratio >= retry_badcase_ratio_threshold {
+                    retry_times += 1;
+                    continue;
+                }
+            }
+            break latent_pred;
         }
-
-        let latent_pred: Tensor<AB, 3> =
-            Tensor::from_data(latent_pred.cast(DType::F32).to_data(), adevice);
-
-        let decode_audio = audio_vae.decode(latent_pred).squeeze_dim::<2>(0);
-        decode_audio.slice([s![..], s![640..-640]]).squeeze()
     }
 
     pub fn forward(
         &mut self,
         text: Tensor<B, 2, Int>,            //Tensor<B, 2>
-        text_mask: Tensor<B, 2>,            //Tensor<B, 2>
+        text_mask: Tensor<B, 2, Int>,       //Tensor<B, 2>
         feat: Tensor<B, 4>,                 //Tensor<B, 4>
-        feat_mask: Tensor<B, 2>,            //Tensor<B, 2>
+        feat_mask: Tensor<B, 2, Int>,       //Tensor<B, 2>
         min_len: Option<usize>,             //2
         max_len: Option<usize>,             //172
         inference_timesteps: Option<usize>, //10
         cfg_value: Option<f32>,             //1
+        _debug: bool,
+        _stop_on_zero: bool,
     ) -> (Tensor<B, 3>, Tensor<B, 3>) {
         //vdbg!(&text, &text_mask, &feat, &feat_mask);
         let min_len = min_len.unwrap_or(2);
@@ -314,6 +378,8 @@ impl<B: Backend> VoxCPM<B> {
         };
 
         let text_embed = text_embed * scale_emb; //Tensor<B, 3>
+        let text_mask = text_mask.float().cast(text_embed.dtype());
+        let feat_mask = feat_mask.float().cast(text_embed.dtype());
         let combined_embed = text_mask.clone().unsqueeze_dims(&[-1]) * text_embed
             + feat_mask.clone().unsqueeze_dims(&[-1]) * feat_embed.clone(); //Tensor<B, 3>
         //
@@ -354,7 +420,7 @@ impl<B: Backend> VoxCPM<B> {
 
         for i in tqdm!(0..max_len) {
             let dit_hidden_1 = self.lm_to_dit_proj.forward(lm_hidden.clone()); //Tensor<B,2>
-            let dit_hidden_2 = self.res_to_dit_proj.forward(residual_hidden); //Tensor<B,2>
+            let dit_hidden_2 = self.res_to_dit_proj.forward(residual_hidden.clone()); //Tensor<B,2>
             let dit_hidden = dit_hidden_1 + dit_hidden_2; //Tensor<B,2>
 
             let pred_feat = self
@@ -381,7 +447,7 @@ impl<B: Backend> VoxCPM<B> {
 
             let stop_data = self
                 .stop_head
-                .forward(silu(self.stop_proj.forward(lm_hidden)));
+                .forward(silu(self.stop_proj.forward(lm_hidden.clone())));
 
             let stop_flag: i64 = stop_data
                 .clone()
@@ -391,7 +457,8 @@ impl<B: Backend> VoxCPM<B> {
                 .as_slice()
                 .unwrap()[0]; //int
 
-            if i > min_len && stop_flag == 1 {
+            let stop_hit = stop_flag == 1;
+            if i > min_len && stop_hit {
                 break;
             }
 
@@ -424,8 +491,8 @@ impl<B: Backend> VoxCPM<B> {
 
         let pred_feat_seq: Tensor<B, 4> = Tensor::cat(pred_feat_seq, 1); //Tensor<B,4>
         let [b, t, _, d] = pred_feat_seq.dims();
-        let pred_feat_seq = pred_feat_seq.permute([0, 3, 1, 2]);
-        let feat_pred = pred_feat_seq
+        let pred_feat_seq_perm = pred_feat_seq.clone().permute([0, 3, 1, 2]);
+        let feat_pred = pred_feat_seq_perm
             .clone()
             .reshape([b, d, t * self.patch_size]); //Tensor<B,2>
 
@@ -435,6 +502,102 @@ impl<B: Backend> VoxCPM<B> {
         //feat_pred torch.Size([64, 168])
 
         (feat_pred, pred_feat_seq.squeeze_dim::<3>(0))
+    }
+}
+
+fn tokenize_masked(tokenizer: &Tokenizer, text: &str) -> Vec<u32> {
+    let encoding = tokenizer.encode(text, false).unwrap();
+    let tokens = encoding.get_tokens();
+    let ids = encoding.get_ids();
+    let mut out = Vec::with_capacity(ids.len());
+    for (token, id) in tokens.iter().zip(ids.iter()) {
+        let clean = token.replace('▁', "");
+        if is_multichar_chinese(&clean) {
+            let mut all_found = true;
+            for ch in clean.chars() {
+                let ch_str = ch.to_string();
+                if let Some(ch_id) = tokenizer.token_to_id(&ch_str) {
+                    out.push(ch_id);
+                } else {
+                    all_found = false;
+                    break;
+                }
+            }
+            if !all_found {
+                out.push(*id);
+            }
+        } else {
+            out.push(*id);
+        }
+    }
+    out
+}
+
+fn is_multichar_chinese(token: &str) -> bool {
+    let mut count = 0usize;
+    for ch in token.chars() {
+        count += 1;
+        if !is_chinese_char(ch) {
+            return false;
+        }
+    }
+    count >= 2
+}
+
+fn is_chinese_char(ch: char) -> bool {
+    ('\u{4E00}'..='\u{9FFF}').contains(&ch)
+}
+
+impl VoxCPM<backend::LibTorch<bf16>> {
+    pub fn generate_libtorch(
+        &mut self,
+        target_text: &str,
+        prompt: Option<(String, Tensor<backend::LibTorch<f32>, 2>)>,
+        tokenizer_path: &Path,
+        min_len: Option<usize>,
+        max_len: Option<usize>,
+        inference_timesteps: Option<usize>,
+        cfg_value: Option<f32>,
+        retry_badcase: bool,
+        retry_badcase_max_times: usize,
+        retry_badcase_ratio_threshold: f32,
+        _debug: bool,
+        _stop_on_zero: bool,
+        audio_vae: &AudioVae<backend::LibTorch<f32>>,
+        device: &<backend::LibTorch<bf16> as Backend>::Device,
+        adevice: &<backend::LibTorch<f32> as Backend>::Device,
+    ) -> Tensor<backend::LibTorch<f32>, 1> {
+        let latent_pred = self.generate_latent(
+            target_text,
+            prompt,
+            tokenizer_path,
+            min_len,
+            max_len,
+            inference_timesteps,
+            cfg_value,
+            retry_badcase,
+            retry_badcase_max_times,
+            retry_badcase_ratio_threshold,
+            _debug,
+            _stop_on_zero,
+            audio_vae,
+            device,
+            adevice,
+        );
+
+        // Keep the cast and device move on GPU to avoid CPU round-trips.
+        let primitive = latent_pred.into_primitive();
+        let tensor = primitive
+            .tensor()
+            .tensor
+            .to_device((*adevice).into())
+            .to_kind(tch::Kind::Float);
+        let latent_pred = Tensor::from_primitive(TensorPrimitive::Float(
+            burn::backend::libtorch::TchTensor::new(tensor),
+        ));
+
+        let decode_audio = audio_vae.decode(latent_pred).squeeze_dim::<2>(0);
+        decode_audio.slice([s![..], s![640..-640]]).squeeze()
     }
 }
 
@@ -617,9 +780,11 @@ impl<B: Backend> UnifiedCFM<B> {
 
         let [batch_size, _channels] = mu.dims();
         let t = patch_size;
-        let z: Tensor<B, 3> =
-            Tensor::random([batch_size, self.in_channels, t], Default::default(), &mu.device())
-                * temperature;
+        let z: Tensor<B, 3> = Tensor::random(
+            [batch_size, self.in_channels, t],
+            Distribution::Normal(0.0, 1.0),
+            &mu.device(),
+        ) * temperature;
 
         let t_span = Self::linespace(1.0, 0.0, (n_timesteps + 1) as u32, &mu.device());
 

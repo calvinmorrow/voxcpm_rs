@@ -8,6 +8,7 @@ use burn::{
     },
     prelude::Backend,
     tensor::{
+        Distribution,
         module::{conv_transpose1d, conv1d},
         ops::{ConvOptions, ConvTransposeOptions, PadMode},
         s,
@@ -414,7 +415,11 @@ impl<B: Backend> NoiseBlock<B> {
     pub fn forward(&self, x: Tensor<B, 3>) -> Tensor<B, 3> {
         //vdbg!(&x);
         let [batch_size, _channels, time_steps] = x.dims();
-        let noise = Tensor::random([batch_size, 1, time_steps], Default::default(), &x.device());
+        let noise = Tensor::random(
+            [batch_size, 1, time_steps],
+            Distribution::Normal(0.0, 1.0),
+            &x.device(),
+        );
         let h = self.linear.forward(x.clone());
         let n = noise * h;
         x + n

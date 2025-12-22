@@ -6,13 +6,21 @@ edition = "2024"
 [dependencies]
 #burn = { path = "../burn/crates/burn",  features = ["tch", "cpu", "candle"] }
 burn = { path = "../burn/crates/burn", features = ["tch", "fusion"] }
-burn-store = { path = "../burn/crates/burn-store", features = ["pytorch", "safetensors"]}
+burn-store = { path = "../burn/crates/burn-store", default-features = false, features = ["std", "burnpack", "memmap"] }
 hound = "3.5.1"
 tokenizers = "0.22.1"
 kdam = "0.6.3"
 clap = { version = "4.5.53", features = ["derive"] }
 serde = { version = "1.0.228", features = ["derive"] }
 tch = "0.22.0"
+
+[features]
+convert = ["burn-store/pytorch", "burn-store/safetensors"]
+
+[[bin]]
+name = "voxcpm-convert"
+path = "src/bin/voxcpm-convert.rs"
+required-features = ["convert"]
 
 #[patch.crates-io]
 #tch = { path = "../tch-rs"}

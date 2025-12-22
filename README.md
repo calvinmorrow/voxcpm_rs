@@ -22,13 +22,13 @@ and applies the PyTorch-compatible safetensors adapter during import.
 git clone https://huggingface.co/openbmb/VoxCPM1.5
 ln -s ../VoxCPM1.5 model
 cd voxcpm_rs
-cargo run --release --bin voxcpm convert --input-path model/ --output-path burn-models/
+cargo run --release --bin voxcpm-convert --features convert --input-path model/ --output-path burn-models/
 ```
 
 Run it.
 
 ```bash
-cargo run --release --bin voxcpm run --model-path burn-models/ \
+cargo run --release --bin voxcpm --model-path burn-models/ \
           --target-text 'VoxCPM is an innovative end-to-end TTS model from ModelBest, designed to generate highly expressive speech.'
 mpv output.wav
 ```
@@ -36,7 +36,7 @@ mpv output.wav
 Or.
 
 ```bash
-cargo run --release --bin voxcpm run --model-path burn-models/ \
+cargo run --release --bin voxcpm --model-path burn-models/ \
             --max-len 200 \
             --target-text 'VoxCPM is an innovative end-to-end TTS model from ModelBest, designed to generate highly expressive speech.' \
             --prompt-text "Having complete focus on a recipe and not allowing yourself to be distracted by your thoughts, can have a therapeutic effect." \
