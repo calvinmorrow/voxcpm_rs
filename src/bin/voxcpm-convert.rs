@@ -5,11 +5,7 @@ use burn::backend::{self};
 use burn::prelude::*;
 use burn::tensor::{PrintOptions, bf16, set_print_options};
 use burn_store::{
-    BurnpackStore,
-    ModuleSnapshot,
-    PyTorchToBurnAdapter,
-    PytorchStore,
-    SafetensorsStore,
+    BurnpackStore, ModuleSnapshot, PyTorchToBurnAdapter, PytorchStore, SafetensorsStore,
 };
 use clap::Parser;
 use tch::Cuda;

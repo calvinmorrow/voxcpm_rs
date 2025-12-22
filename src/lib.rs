@@ -1,5 +1,9 @@
+pub mod audio_utils;
 pub mod audiovae;
 pub mod minicpm4;
+pub mod openai_error;
+pub mod openai_types;
+pub mod voice_registry;
 pub mod voxcpm;
 
 pub fn type_name_of_function<T>(_: T) -> &'static str {

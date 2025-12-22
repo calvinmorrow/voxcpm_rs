@@ -11,6 +11,10 @@ Add a non-streaming, OpenAI-compatible TTS HTTP server backed by VoxCPM, with su
 - Each request should log **RTF (real-time factor)** as `response_time / audio_length`.
 - Add `/v1/audio/chatterbox/voices` for SillyTavern compatibility; it should return **VoxCPM voices**.
 - Use a **JSON** registry on disk (simplest durable store).
+  - Default voice is the **first registry entry**.
+  - `voice_id` is a **slug of the label**, with a short suffix on collision.
+  - Error responses follow the **OpenAI error JSON** shape.
+  - `random` should select a **random registry entry**.
 
 ## Proposed Server Framework
 - **axum** + **tokio** for routing, async responses, and an easy path to future streaming.
@@ -56,6 +60,7 @@ Add a non-streaming, OpenAI-compatible TTS HTTP server backed by VoxCPM, with su
   ```
 - Use the **VoxCPM registry** as the source of truth (no separate chatterbox voices).
 - `label` and `value` should both be the `voice_id` for compatibility.
+- `random` in the chatterbox list should map to a random registry voice.
 
 ### GET /healthz
 - Simple readiness probe.
@@ -96,12 +101,11 @@ Add a non-streaming, OpenAI-compatible TTS HTTP server backed by VoxCPM, with su
 - `axum`, `tokio`, `tower`, `serde`, `serde_json`, `bytes`, `uuid` or `ulid`.
 - Audio:
   - `hound` for WAV I/O.
-  - `rubato` for resampling (or `symphonia` + `rubato` if wider format support is desired).
+  - Simple linear resampling to 44.1 kHz.
 
 ## Next Steps
-1) Decide `voice_id` format and ensure it is suitable as a label.
-2) Implement server binary, shared state, and registry module.
-3) Add upload handler with resampling to 44.1 kHz mono.
-4) Wire `/v1/audio/speech` to VoxCPM non-streaming generation.
-5) Add chatterbox voices list endpoint backed by registry.
-6) Add per-request timing and RTF logging.
+1) Implement server binary, shared state, and registry module.
+2) Add upload handler with resampling to 44.1 kHz mono.
+3) Wire `/v1/audio/speech` to VoxCPM non-streaming generation.
+4) Add chatterbox voices list endpoint backed by registry.
+5) Add per-request timing and RTF logging.

@@ -7,15 +7,16 @@ use burn::{
     nn::{Linear, LinearConfig},
     prelude::Backend,
     tensor::{
-        DType, Distribution, Int, bf16,
+        DType, Distribution, Int,
         activation::{silu, tanh},
+        bf16,
         ops::PadMode,
     },
 };
 
+use burn::backend;
 use burn::prelude::*;
 use burn::tensor::TensorPrimitive;
-use burn::backend;
 use kdam::tqdm;
 use tokenizers::Tokenizer;
 
@@ -247,10 +248,8 @@ impl<B: Backend> VoxCPM<B> {
                 .permute([1, 2, 0]);
 
             let audio_feat = audio_feat.slice([s![..-1], s![..], s![..]]);
-            let audio_feat = Tensor::<B, 3>::from_data(
-                audio_feat.to_data().convert_dtype(DType::BF16),
-                device,
-            );
+            let audio_feat =
+                Tensor::<B, 3>::from_data(audio_feat.to_data().convert_dtype(DType::BF16), device);
             let audio_length = audio_feat.dims()[0];
             let text_pad_token: Tensor<B, 1, Int> = Tensor::zeros([audio_length], device);
 
@@ -316,8 +315,9 @@ impl<B: Backend> VoxCPM<B> {
         let audio_mask = audio_mask_in.unsqueeze();
 
         let max_len = max_len.unwrap_or(2000);
-        let max_len = ((target_text_length as f32 * retry_badcase_ratio_threshold).round() as usize + 10)
-            .min(max_len);
+        let max_len =
+            ((target_text_length as f32 * retry_badcase_ratio_threshold).round() as usize + 10)
+                .min(max_len);
         let mut retry_times = 0usize;
         loop {
             let (latent_pred, pred_audio_feat) = self.forward(
@@ -334,7 +334,8 @@ impl<B: Backend> VoxCPM<B> {
             );
             let pred_audio_feat_len = pred_audio_feat.dims()[0];
             let ratio = pred_audio_feat_len as f32 / target_text_length as f32;
-            if pred_audio_feat_len as f32 >= target_text_length as f32 * retry_badcase_ratio_threshold
+            if pred_audio_feat_len as f32
+                >= target_text_length as f32 * retry_badcase_ratio_threshold
             {
                 println!("Badcase detected, audio_text_ratio={}", ratio);
             }
@@ -660,10 +661,12 @@ impl<B: Backend> VoxCPMLocEnc<B> {
         let [batch_size, time_steps, _patches, _channels] = x.dims();
 
         let x = self.in_proj.forward(x);
-        let special_tokens =
-            self.special_token
-                .val()
-                .expand([batch_size, time_steps, 1, self.special_token.val().dims()[3]]);
+        let special_tokens = self.special_token.val().expand([
+            batch_size,
+            time_steps,
+            1,
+            self.special_token.val().dims()[3],
+        ]);
         let x = Tensor::cat(vec![special_tokens, x], 2);
         let [b, t, p, c] = x.dims();
         let x = x.reshape([b * t, p, c]);

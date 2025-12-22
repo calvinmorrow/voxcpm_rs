@@ -1,0 +1,463 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta
+      name="viewport"
+      content="width=device-width, initial-scale=1"
+    />
+    <title>VoxCPM Voice Upload</title>
+    <style>
+      :root {
+        color-scheme: light;
+        --bg: #f2eee7;
+        --ink: #1a1a1a;
+        --accent: #0b6e4f;
+        --accent-2: #f25f5c;
+        --panel: #fff7ed;
+        --muted: #6b5b4b;
+        --border: #d6c9b8;
+      }
+      * {
+        box-sizing: border-box;
+      }
+      body {
+        margin: 0;
+        font-family: "Fira Sans", "Trebuchet MS", sans-serif;
+        background: radial-gradient(1200px 700px at 10% -10%, #ffe9c7, transparent),
+          radial-gradient(900px 500px at 110% 10%, #ffd6d1, transparent),
+          var(--bg);
+        color: var(--ink);
+      }
+      .wrap {
+        max-width: 980px;
+        margin: 0 auto;
+        padding: 48px 20px 80px;
+      }
+      header {
+        display: flex;
+        flex-wrap: wrap;
+        justify-content: space-between;
+        align-items: baseline;
+        gap: 12px;
+      }
+      h1 {
+        font-size: clamp(28px, 3vw, 40px);
+        margin: 0;
+        letter-spacing: -0.02em;
+      }
+      .subtitle {
+        font-size: 14px;
+        color: var(--muted);
+      }
+      .panel {
+        margin-top: 28px;
+        background: var(--panel);
+        border: 1px solid var(--border);
+        border-radius: 18px;
+        padding: 24px;
+        box-shadow: 0 16px 30px rgba(26, 26, 26, 0.08);
+      }
+      .panel + .panel {
+        margin-top: 20px;
+      }
+      form {
+        display: grid;
+        gap: 18px;
+      }
+      label {
+        font-weight: 600;
+        font-size: 14px;
+      }
+      input[type="text"],
+      textarea {
+        width: 100%;
+        border: 1px solid var(--border);
+        border-radius: 10px;
+        padding: 12px 14px;
+        font-size: 15px;
+        background: #fffdf9;
+      }
+      textarea {
+        min-height: 140px;
+        resize: vertical;
+      }
+      input[type="file"] {
+        width: 100%;
+        padding: 10px 0;
+      }
+      .hint {
+        color: var(--muted);
+        font-size: 13px;
+      }
+      .actions {
+        display: flex;
+        flex-wrap: wrap;
+        gap: 12px;
+        align-items: center;
+      }
+      button {
+        border: none;
+        background: var(--accent);
+        color: #fff;
+        font-weight: 700;
+        padding: 12px 18px;
+        border-radius: 999px;
+        cursor: pointer;
+        transition: transform 150ms ease, box-shadow 150ms ease;
+        box-shadow: 0 8px 16px rgba(11, 110, 79, 0.25);
+      }
+      button:disabled {
+        opacity: 0.6;
+        cursor: not-allowed;
+        box-shadow: none;
+      }
+      button:hover:not(:disabled) {
+        transform: translateY(-1px);
+      }
+      .status {
+        font-size: 14px;
+        font-weight: 600;
+      }
+      .status.ok {
+        color: var(--accent);
+      }
+      .status.err {
+        color: var(--accent-2);
+      }
+      pre {
+        background: #111;
+        color: #f8f2e9;
+        padding: 16px;
+        border-radius: 12px;
+        overflow: auto;
+        font-size: 13px;
+        line-height: 1.5;
+      }
+      .grid {
+        display: grid;
+        gap: 16px;
+        grid-template-columns: minmax(0, 1fr);
+      }
+      @media (min-width: 860px) {
+        .grid {
+          grid-template-columns: minmax(0, 1fr) minmax(0, 1fr);
+        }
+      }
+      .status-row {
+        display: flex;
+        flex-wrap: wrap;
+        gap: 12px;
+        align-items: center;
+        font-size: 14px;
+        color: var(--muted);
+      }
+      .badge {
+        display: inline-flex;
+        align-items: center;
+        gap: 8px;
+        padding: 6px 12px;
+        border-radius: 999px;
+        background: #fffdf9;
+        border: 1px solid var(--border);
+        font-weight: 600;
+        color: var(--ink);
+      }
+      .badge.ok {
+        color: var(--accent);
+        border-color: rgba(11, 110, 79, 0.35);
+      }
+      .badge.err {
+        color: var(--accent-2);
+        border-color: rgba(242, 95, 92, 0.4);
+      }
+      .section-title {
+        font-size: 16px;
+        font-weight: 700;
+        margin: 0 0 8px;
+      }
+      .row {
+        display: grid;
+        gap: 12px;
+      }
+      select {
+        width: 100%;
+        border: 1px solid var(--border);
+        border-radius: 10px;
+        padding: 10px 12px;
+        font-size: 15px;
+        background: #fffdf9;
+      }
+      audio {
+        width: 100%;
+        margin-top: 6px;
+      }
+      .small {
+        font-size: 12px;
+        color: var(--muted);
+      }
+    </style>
+  </head>
+  <body>
+    <div class="wrap">
+      <header>
+        <h1>VoxCPM Voice Upload</h1>
+        <div class="subtitle">Upload a WAV + transcript to register a voice profile.</div>
+      </header>
+      <div class="panel">
+        <div class="status-row">
+          <div id="health-badge" class="badge">Checking health…</div>
+          <div id="voices-badge" class="badge">Voices: --</div>
+          <button id="refresh-status" type="button">Refresh</button>
+        </div>
+        <div class="small">Status uses /healthz and /v1/voices.</div>
+      </div>
+      <div class="panel">
+        <div class="grid">
+          <form id="voice-form">
+            <div>
+              <label for="label">Label (optional)</label>
+              <input id="label" name="label" type="text" placeholder="alan_rickman" />
+              <div class="hint">Used to create a slug voice_id. Collision adds a short suffix.</div>
+            </div>
+            <div>
+              <label for="transcript">Transcript</label>
+              <textarea
+                id="transcript"
+                name="transcript"
+                placeholder="Enter the exact transcript of the audio clip."
+                required
+              ></textarea>
+            </div>
+            <div>
+              <label for="file">WAV File</label>
+              <input id="file" name="file" type="file" accept=".wav,audio/wav" required />
+              <div class="hint">Uploads are resampled to 44.1 kHz mono.</div>
+            </div>
+            <div class="actions">
+              <button type="submit" id="submit-btn">Upload Voice</button>
+              <span id="status" class="status"></span>
+            </div>
+          </form>
+          <div>
+            <label>Server Response</label>
+            <pre id="response">Waiting for upload…</pre>
+          </div>
+        </div>
+      </div>
+      <div class="panel">
+        <div class="grid">
+          <form id="speech-form">
+            <div class="section-title">Generate Speech</div>
+            <div class="row">
+              <label for="speech-input">Text</label>
+              <textarea
+                id="speech-input"
+                name="input"
+                placeholder="Enter text to synthesize."
+                required
+              ></textarea>
+            </div>
+            <div class="row">
+              <label for="voice-select">Voice</label>
+              <select id="voice-select" name="voice"></select>
+              <div class="hint">Includes "random" and registered voice_ids.</div>
+            </div>
+            <div class="row">
+              <label for="format-select">Response format</label>
+              <select id="format-select" name="response_format">
+                <option value="wav" selected>wav</option>
+                <option value="pcm">pcm</option>
+              </select>
+            </div>
+            <div class="actions">
+              <button type="submit" id="speech-btn">Generate</button>
+              <span id="speech-status" class="status"></span>
+            </div>
+            <audio id="speech-audio" controls></audio>
+          </form>
+          <div>
+            <label>Generation Response</label>
+            <pre id="speech-response">Waiting for generation…</pre>
+          </div>
+        </div>
+      </div>
+      <div class="panel">
+        <div class="grid">
+          <div>
+            <div class="section-title">Registered Voices (/v1/voices)</div>
+            <pre id="voices-response">Loading…</pre>
+          </div>
+          <div>
+            <div class="section-title">Chatterbox Voices (/v1/audio/chatterbox/voices)</div>
+            <pre id="chatterbox-response">Loading…</pre>
+          </div>
+        </div>
+      </div>
+    </div>
+    <script>
+      const form = document.getElementById("voice-form");
+      const statusEl = document.getElementById("status");
+      const responseEl = document.getElementById("response");
+      const submitBtn = document.getElementById("submit-btn");
+      const speechForm = document.getElementById("speech-form");
+      const speechBtn = document.getElementById("speech-btn");
+      const speechStatus = document.getElementById("speech-status");
+      const speechResponse = document.getElementById("speech-response");
+      const speechAudio = document.getElementById("speech-audio");
+      const voiceSelect = document.getElementById("voice-select");
+      const formatSelect = document.getElementById("format-select");
+      const voicesResponse = document.getElementById("voices-response");
+      const chatterboxResponse = document.getElementById("chatterbox-response");
+      const healthBadge = document.getElementById("health-badge");
+      const voicesBadge = document.getElementById("voices-badge");
+      const refreshStatusBtn = document.getElementById("refresh-status");
+
+      form.addEventListener("submit", async (event) => {
+        event.preventDefault();
+        statusEl.textContent = "Uploading…";
+        statusEl.className = "status";
+        responseEl.textContent = "";
+        submitBtn.disabled = true;
+
+        try {
+          const formData = new FormData(form);
+          const response = await fetch("/v1/voices", {
+            method: "POST",
+            body: formData,
+          });
+          const bodyText = await response.text();
+          responseEl.textContent = bodyText || "(empty response)";
+          if (response.ok) {
+            statusEl.textContent = "Upload complete";
+            statusEl.classList.add("ok");
+          } else {
+            statusEl.textContent = `Upload failed (${response.status})`;
+            statusEl.classList.add("err");
+          }
+        } catch (err) {
+          statusEl.textContent = "Upload failed";
+          statusEl.classList.add("err");
+          responseEl.textContent = err && err.message ? err.message : String(err);
+        } finally {
+          submitBtn.disabled = false;
+        }
+      });
+
+      async function fetchJson(url) {
+        const response = await fetch(url);
+        const text = await response.text();
+        let data = null;
+        try {
+          data = text ? JSON.parse(text) : null;
+        } catch (err) {
+          data = null;
+        }
+        return { response, text, data };
+      }
+
+      async function refreshLists() {
+        const voicesResult = await fetchJson("/v1/voices");
+        voicesResponse.textContent =
+          voicesResult.text || "(empty response)";
+        const chatterboxResult = await fetchJson("/v1/audio/chatterbox/voices");
+        chatterboxResponse.textContent =
+          chatterboxResult.text || "(empty response)";
+
+        const voices = voicesResult.data && voicesResult.data.voices
+          ? voicesResult.data.voices
+          : [];
+        updateVoiceSelect(voices);
+        voicesBadge.textContent = `Voices: ${voices.length}`;
+      }
+
+      function updateVoiceSelect(voices) {
+        const options = [];
+        options.push({ label: "random", value: "random" });
+        voices.forEach((voice) => {
+          options.push({ label: voice.voice_id, value: voice.voice_id });
+        });
+        voiceSelect.innerHTML = "";
+        options.forEach((opt) => {
+          const option = document.createElement("option");
+          option.value = opt.value;
+          option.textContent = opt.label;
+          voiceSelect.appendChild(option);
+        });
+      }
+
+      async function refreshHealth() {
+        healthBadge.textContent = "Checking health…";
+        healthBadge.className = "badge";
+        try {
+          const response = await fetch("/healthz");
+          if (response.ok) {
+            healthBadge.textContent = "Healthy";
+            healthBadge.classList.add("ok");
+          } else {
+            healthBadge.textContent = `Unhealthy (${response.status})`;
+            healthBadge.classList.add("err");
+          }
+        } catch (err) {
+          healthBadge.textContent = "Health check failed";
+          healthBadge.classList.add("err");
+        }
+      }
+
+      refreshStatusBtn.addEventListener("click", () => {
+        refreshHealth();
+        refreshLists();
+      });
+
+      speechForm.addEventListener("submit", async (event) => {
+        event.preventDefault();
+        speechStatus.textContent = "Generating…";
+        speechStatus.className = "status";
+        speechResponse.textContent = "";
+        speechBtn.disabled = true;
+        speechAudio.removeAttribute("src");
+
+        try {
+          const payload = {
+            input: document.getElementById("speech-input").value,
+            voice: voiceSelect.value,
+            response_format: formatSelect.value,
+            stream: false,
+          };
+          const response = await fetch("/v1/audio/speech", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify(payload),
+          });
+          if (response.ok) {
+            const blob = await response.blob();
+            speechResponse.textContent = `Success (${blob.type || "audio"})`;
+            if (payload.response_format === "wav") {
+              const url = URL.createObjectURL(blob);
+              speechAudio.src = url;
+              speechAudio.load();
+            } else {
+              speechAudio.removeAttribute("src");
+            }
+            speechStatus.textContent = "Done";
+            speechStatus.classList.add("ok");
+          } else {
+            const text = await response.text();
+            speechResponse.textContent = text || "(empty response)";
+            speechStatus.textContent = `Failed (${response.status})`;
+            speechStatus.classList.add("err");
+          }
+        } catch (err) {
+          speechStatus.textContent = "Generation failed";
+          speechStatus.classList.add("err");
+          speechResponse.textContent = err && err.message ? err.message : String(err);
+        } finally {
+          speechBtn.disabled = false;
+        }
+      });
+
+      refreshHealth();
+      refreshLists();
+    </script>
+  </body>
+</html>

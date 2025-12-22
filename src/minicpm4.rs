@@ -130,7 +130,11 @@ impl<B: Backend> MiniCPMModel<B> {
         (hidden_states, next_decoder_cache)
     }
 
-    pub fn forward_step(&mut self, inputs_embeds: Tensor<B, 2>, position_id: usize) -> Tensor<B, 2> {
+    pub fn forward_step(
+        &mut self,
+        inputs_embeds: Tensor<B, 2>,
+        position_id: usize,
+    ) -> Tensor<B, 2> {
         //vdbg!(&inputs_embeds);
 
         let position_emb = self
@@ -257,9 +261,13 @@ impl<B: Backend> MiniCPMDecoderLayer<B> {
         let residual = hidden_states.clone();
         let hidden_states = self.input_layernorm.forward(hidden_states);
 
-        let hidden_states =
-            self.self_attn
-                .forward_step(hidden_states.clone(), position_emb, position_id, kv_cache_index, kv_cache);
+        let hidden_states = self.self_attn.forward_step(
+            hidden_states.clone(),
+            position_emb,
+            position_id,
+            kv_cache_index,
+            kv_cache,
+        );
 
         let hidden_states = if self.use_mup {
             residual + hidden_states * (self.scale_depth / (self.num_hidden_layers as f32).sqrt())
@@ -272,7 +280,7 @@ impl<B: Backend> MiniCPMDecoderLayer<B> {
         let hidden_states = self.post_attention_layernorm.forward(hidden_states);
         let hidden_states = self.mlp.forward(hidden_states);
 
-        let hidden_states =if self.use_mup {
+        let hidden_states = if self.use_mup {
             residual + hidden_states * (self.scale_depth / (self.num_hidden_layers as f32).sqrt())
         } else {
             residual + hidden_states

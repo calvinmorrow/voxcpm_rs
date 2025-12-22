@@ -180,17 +180,23 @@ fn read_wav(path: &str) -> Vec<f32> {
     }
 }
 
-
 fn select_device(override_device: Option<&str>) -> LibTorchDevice {
     let cuda_available = Cuda::is_available();
-    let cuda_count = if cuda_available { Cuda::device_count() } else { 0 };
+    let cuda_count = if cuda_available {
+        Cuda::device_count()
+    } else {
+        0
+    };
     println!(
         "Device probe: cuda_available={}, cuda_device_count={}",
         cuda_available, cuda_count
     );
     if let Some(override_device) = override_device {
         let selected = parse_device_override(override_device);
-        println!("Device override: requested='{}', selected={:?}", override_device, selected);
+        println!(
+            "Device override: requested='{}', selected={:?}",
+            override_device, selected
+        );
         return selected;
     }
     if Cuda::is_available() && Cuda::device_count() > 0 {
