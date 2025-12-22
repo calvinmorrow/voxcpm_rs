@@ -75,6 +75,10 @@ pub struct AudioVae<B: Backend> {
 }
 
 impl<B: Backend> AudioVae<B> {
+    pub fn device(&self) -> B::Device {
+        self.encoder.fc_mu.weight_g.val().device()
+    }
+
     pub fn preprocess(&self, audio_date: Tensor<B, 3>, sample_rate: Option<usize>) -> Tensor<B, 3> {
         let _sample_rate = match sample_rate {
             Some(val) => val,

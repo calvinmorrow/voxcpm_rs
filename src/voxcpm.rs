@@ -1,4 +1,4 @@
-use std::{marker::PhantomData, path::Path};
+use std::{marker::PhantomData, path::Path, time::Instant};
 
 use burn::{
     Tensor,
@@ -567,6 +567,7 @@ impl VoxCPM<backend::LibTorch<bf16>> {
         device: &<backend::LibTorch<bf16> as Backend>::Device,
         adevice: &<backend::LibTorch<f32> as Backend>::Device,
     ) -> Tensor<backend::LibTorch<f32>, 1> {
+        let t_start = Instant::now();
         let latent_pred = self.generate_latent(
             target_text,
             prompt,
@@ -584,6 +585,7 @@ impl VoxCPM<backend::LibTorch<bf16>> {
             device,
             adevice,
         );
+        let t_latent = t_start.elapsed();
 
         // Keep the cast and device move on GPU to avoid CPU round-trips.
         let primitive = latent_pred.into_primitive();
@@ -596,7 +598,16 @@ impl VoxCPM<backend::LibTorch<bf16>> {
             burn::backend::libtorch::TchTensor::new(tensor),
         ));
 
+        let t_decode_start = Instant::now();
+        println!("Device check: latent_pred={:?}", latent_pred.device());
+        println!("Device check: audio_vae={:?}", audio_vae.device());
         let decode_audio = audio_vae.decode(latent_pred).squeeze_dim::<2>(0);
+        let t_decode = t_decode_start.elapsed();
+        println!(
+            "Timing: latent_gen={:.3}s decode={:.3}s",
+            t_latent.as_secs_f64(),
+            t_decode.as_secs_f64()
+        );
         decode_audio.slice([s![..], s![640..-640]]).squeeze()
     }
 }

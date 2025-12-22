@@ -1,4 +1,4 @@
-use std::path::Path;
+use std::{path::Path, time::Instant};
 
 use burn::backend::libtorch::LibTorchDevice;
 use burn::backend::{self};
@@ -76,6 +76,7 @@ fn run(args: Args) {
         _ => panic!("provide none or both prompt text and prompt audio"),
     };
 
+    let t_gen_start = Instant::now();
     let wav = tts.generate_libtorch(
         args.target_text
             .as_deref()
@@ -95,8 +96,11 @@ fn run(args: Args) {
         &tts_device,
         &audio_device,
     );
+    let t_gen = t_gen_start.elapsed();
 
+    let t_convert_start = Instant::now();
     let wav: Vec<f32> = wav.cast(DType::F32).to_data().to_vec().unwrap();
+    let t_convert = t_convert_start.elapsed();
 
     let spec = hound::WavSpec {
         channels: 1,
@@ -108,10 +112,18 @@ fn run(args: Args) {
         hound::WavWriter::create(args.output_path.as_deref().unwrap_or("output.wav"), spec)
             .unwrap();
 
+    let t_write_start = Instant::now();
     for s in wav.iter() {
         let i = ((*s * (i16::MAX as f32)).clamp(i16::MIN as f32, i16::MAX as f32)).round() as i16;
         writer.write_sample(i).unwrap();
     }
+    let t_write = t_write_start.elapsed();
+    println!(
+        "Timing: generate_total={:.3}s wav_convert={:.3}s wav_write={:.3}s",
+        t_gen.as_secs_f64(),
+        t_convert.as_secs_f64(),
+        t_write.as_secs_f64()
+    );
 }
 
 fn read_wav(path: &str) -> Vec<f32> {
