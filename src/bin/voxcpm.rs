@@ -15,6 +15,7 @@ use burn_store::{
 use burn::tensor::{PrintOptions, set_print_options};
 use clap::Parser;
 use hound::{Sample, SampleFormat, WavReader, WavSpec};
+use tch::Cuda;
 use voxcpm_rs::audiovae::AudioVae;
 use voxcpm_rs::voxcpm::{VoxCPM, VoxCPMConfig};
 
@@ -26,6 +27,8 @@ enum Args {
         input_path: String,
         #[arg(long)]
         output_path: String,
+        #[arg(long)]
+        device: Option<String>,
     },
     Run {
         #[arg(long)]
@@ -52,6 +55,8 @@ enum Args {
         retry_badcase_ratio_threshold: Option<f32>,
         #[arg(long)]
         output_path: Option<String>,
+        #[arg(long)]
+        device: Option<String>,
     },
 }
 
@@ -69,6 +74,7 @@ fn run(args: Args) {
         retry_badcase_max_times,
         retry_badcase_ratio_threshold,
         output_path,
+        device,
     ) = match args {
         Args::Convert { .. } => panic!("shouldn't be here!"),
         Args::Run {
@@ -84,6 +90,7 @@ fn run(args: Args) {
             retry_badcase_max_times,
             retry_badcase_ratio_threshold,
             output_path,
+            device,
         } => (
             target_text,
             prompt_text,
@@ -97,13 +104,14 @@ fn run(args: Args) {
             retry_badcase_max_times,
             retry_badcase_ratio_threshold,
             output_path,
+            device,
         ),
     };
 
     type BTts = backend::LibTorch<bf16>;
     type BAud = backend::LibTorch<f32>;
-    let tts_device: LibTorchDevice = Default::default();
-    let audio_device: LibTorchDevice = Default::default();
+    let tts_device = select_device(device.as_deref());
+    let audio_device = select_device(device.as_deref());
 
     let model_path = Path::new(&model_path);
 
@@ -219,6 +227,32 @@ fn read_wav(path: &str) -> Vec<f32> {
     }
 }
 
+fn select_device(override_device: Option<&str>) -> LibTorchDevice {
+    if let Some(override_device) = override_device {
+        return parse_device_override(override_device);
+    }
+    if Cuda::is_available() && Cuda::device_count() > 0 {
+        return LibTorchDevice::Cuda(0);
+    }
+    LibTorchDevice::Cpu
+}
+
+fn parse_device_override(device: &str) -> LibTorchDevice {
+    let normalized = device.trim().to_ascii_lowercase();
+    if normalized == "cpu" {
+        return LibTorchDevice::Cpu;
+    }
+    if normalized == "cuda" {
+        return LibTorchDevice::Cuda(0);
+    }
+    if let Some(index) = normalized.strip_prefix("cuda:") {
+        if let Ok(index) = index.parse::<usize>() {
+            return LibTorchDevice::Cuda(index);
+        }
+    }
+    LibTorchDevice::Cpu
+}
+
 fn main() {
     let print_options = PrintOptions {
         precision: Some(4),
@@ -232,12 +266,13 @@ fn main() {
         Args::Convert {
             input_path,
             output_path,
-        } => convert(&input_path, &output_path),
+            device,
+        } => convert(&input_path, &output_path, device.as_deref()),
         run_args @ Args::Run { .. } => run(run_args),
     }
 }
 
-fn convert(input_path: &str, output_path: &str) {
+fn convert(input_path: &str, output_path: &str, device: Option<&str>) {
     let input_path = Path::new(input_path);
     let output_path = Path::new(output_path);
     if !output_path.exists() {
@@ -245,8 +280,8 @@ fn convert(input_path: &str, output_path: &str) {
     }
     type BTts = backend::LibTorch<bf16>;
     type BAud = backend::LibTorch<f32>;
-    let tts_device: LibTorchDevice = Default::default();
-    let audio_device: LibTorchDevice = Default::default();
+    let tts_device = select_device(device);
+    let audio_device = select_device(device);
     let tts_config =
         VoxCPMConfig::load(input_path.join("config.json")).expect("couldn't load model config");
     let mut tts: VoxCPM<BTts> = tts_config.init(&tts_device);

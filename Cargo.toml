@@ -12,6 +12,7 @@ tokenizers = "0.22.1"
 kdam = "0.6.3"
 clap = { version = "4.5.53", features = ["derive"] }
 serde = { version = "1.0.228", features = ["derive"] }
+tch = "0.22.0"
 
 #[patch.crates-io]
 #tch = { path = "../tch-rs"}

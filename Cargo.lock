@@ -6543,6 +6543,7 @@ dependencies = [
  "hound",
  "kdam",
  "serde",
+ "tch",
  "tokenizers",
 ]
 
