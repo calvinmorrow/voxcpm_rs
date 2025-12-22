@@ -1,20 +1,39 @@
 # Python 3.12 w/ ROCm 7.1.1
 FROM docker.io/rocm/pytorch:rocm7.1.1_ubuntu24.04_py3.12_pytorch_release_2.9.1 AS build
 
+ARG AMDGPU_TARGETS="gfx1100;gfx1151;gfx1201"
+
 # Install Pre-reqs
 RUN apt-get update && apt-get install --no-install-recommends -y \
-    git vim nano build-essential rustup && \
+    git build-essential rustup && \
     rustup default stable && \
     mkdir /app
 
-COPY . /app/
+COPY Cargo.lock Cargo.toml /app/
+COPY src/ /app/src/
+COPY static/ /app/static/
 
 WORKDIR /app
+
+RUN git clone https://github.com/tracel-ai/burn && \
+    cd burn && \
+    git checkout 65511109f46e734350b9d58f792957d5e2c7fee4
+
+ENV AMDGPU_TARGETS=$AMDGPU_TARGETS \
+    PYTORCH_ROCM_ARCH=$AMDGPU_TARGETS \
+    LIBTORCH_USE_PYTORCH=1 \
+    LIBTORCH_BYPASS_VERSION_CHECK=1
+    # Expects Torch 2.9.0
 
 RUN cargo build --release
 
 
 FROM docker.io/rocm/pytorch:rocm7.1.1_ubuntu24.04_py3.12_pytorch_release_2.9.1 AS release
+
+WORKDIR /app
+
+RUN mkdir -p /app/voices \
+    mkdir -p /app/burn-models
 
 ENV LIBTORCH=/opt/venv/lib/python3.12/site-packages/torch \
     TORCH_ROCM_AOTRITON_ENABLE_EXPERIMENTAL=1 \
@@ -22,8 +41,15 @@ ENV LIBTORCH=/opt/venv/lib/python3.12/site-packages/torch \
     MIOPEN_FIND_MODE=2 \
     LD_LIBRARY_PATH=/opt/venv/lib/python3.12/site-packages/torch/lib:$LD_LIBRARY_PATH
 
-COPY --from=build /app/target/release/* /app/
+RUN apt-get update && apt-get install --no-install-recommends -y \
+    dumb-init && \
+    apt-get clean && \
+    rm -rf /var/lib/apt/lists
 
-COPY voices static burn-models LICENSE /app/
+COPY --from=build /app/target/release/voxcpm* /app/
 
-COMMAND ["voxcpm-server"]
+COPY burn-models LICENSE /app/burn-models
+COPY static LICENSE /app/static
+
+ENTRYPOINT ["/usr/bin/dumb-init", "--"]
+CMD ["/app/voxcpm-server"]
