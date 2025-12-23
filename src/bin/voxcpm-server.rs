@@ -216,12 +216,26 @@ async fn handle_chatterbox_voices(
         value: "random".to_string(),
     });
     for voice in &registry.voices {
+        let value = chatterbox_value(&voice.wav_path);
         voices.push(ChatterboxVoice {
             label: voice.voice_id.clone(),
-            value: voice.voice_id.clone(),
+            value,
         });
     }
     Ok(Json(ChatterboxVoicesResponse { voices }))
+}
+
+fn chatterbox_value(wav_path: &str) -> String {
+    let path = Path::new(wav_path);
+    let name = path
+        .file_name()
+        .map(|name| name.to_string_lossy().to_string())
+        .unwrap_or_else(|| wav_path.to_string());
+    if name.ends_with(".wav") {
+        name
+    } else {
+        format!("{}.wav", name)
+    }
 }
 
 async fn handle_upload_voice(

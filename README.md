@@ -77,4 +77,4 @@ Additional endpoints:
 - `GET /healthz`
 - `GET /v1/voices`
 - `POST /v1/voices`
-- `GET /v1/audio/chatterbox/voices`
+- `GET /v1/audio/chatterbox/voices` (Compatibility Endpoint with TTS-WebUI)
