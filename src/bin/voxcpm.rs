@@ -3,7 +3,7 @@ use std::{path::Path, time::Instant};
 use burn::backend::libtorch::LibTorchDevice;
 use burn::backend::{self};
 use burn::prelude::*;
-use burn::tensor::{DType, bf16};
+use burn::tensor::{DType, bf16, f16};
 use burn_store::{BurnpackStore, ModuleSnapshot};
 
 use burn::tensor::{PrintOptions, set_print_options};
@@ -16,8 +16,10 @@ use voxcpm_rs::voxcpm::{VoxCPM, VoxCPMConfig};
 #[derive(Parser, Debug)]
 #[command(version, about, long_about = None)]
 struct Args {
-    #[arg(long)]
+    #[arg(long, default_value = "burn-models")]
     model_path: String,
+    #[arg(long, value_enum, default_value = "bf16")]
+    tts_dtype: TtsDtype,
     #[arg(long)]
     target_text: Option<String>,
     #[arg(long)]
@@ -44,32 +46,54 @@ struct Args {
     device: Option<String>,
 }
 
-type BTts = backend::LibTorch<bf16>;
 type BAud = backend::LibTorch<f32>;
+
+#[derive(clap::ValueEnum, Clone, Copy, Debug)]
+enum TtsDtype {
+    Bf16,
+    F16,
+}
+
+impl TtsDtype {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Bf16 => "bf16",
+            Self::F16 => "f16",
+        }
+    }
+}
 
 fn run(args: Args) {
     let tts_device = select_device(args.device.as_deref());
     let audio_device = select_device(args.device.as_deref());
 
-    let model_path = Path::new(&args.model_path);
+    let model_path = resolve_model_path(&args.model_path, args.tts_dtype);
 
+    match args.tts_dtype {
+        TtsDtype::Bf16 => run_bf16(&args, &model_path, &tts_device, &audio_device),
+        TtsDtype::F16 => run_f16(&args, &model_path, &tts_device, &audio_device),
+    }
+}
+
+fn run_bf16(args: &Args, model_path: &Path, tts_device: &LibTorchDevice, audio_device: &LibTorchDevice) {
+    type BTts = backend::LibTorch<bf16>;
     let tts_config = VoxCPMConfig::load(model_path.join("config.json")).unwrap();
-    let mut tts: VoxCPM<BTts> = tts_config.init(&tts_device);
+    let mut tts: VoxCPM<BTts> = tts_config.init(tts_device);
 
     let mut store = BurnpackStore::from_file(model_path.join("voxcpm.bpk"));
     tts.load_from(&mut store)
         .expect("couldn't load tts model from burnpack");
 
-    let mut audio_vae: AudioVae<BAud> = tts_config.audio_vae_config.init(&audio_device);
+    let mut audio_vae: AudioVae<BAud> = tts_config.audio_vae_config.init(audio_device);
     let mut store = BurnpackStore::from_file(model_path.join("audiovae.bpk"));
     audio_vae
         .load_from(&mut store)
         .expect("couldn't load audio_vae model from burnpack");
 
-    let prompt = match (args.prompt_text, args.prompt_wav_path) {
+    let prompt = match (&args.prompt_text, &args.prompt_wav_path) {
         (Some(prompt_text), Some(prompt_wav_path)) => Some((
-            prompt_text,
-            Tensor::<BAud, 1>::from_floats(&read_wav(&prompt_wav_path)[..], &audio_device)
+            prompt_text.clone(),
+            Tensor::<BAud, 1>::from_floats(&read_wav(prompt_wav_path)[..], audio_device)
                 .unsqueeze(),
         )),
         (None, None) => None,
@@ -93,8 +117,83 @@ fn run(args: Args) {
         false,
         false,
         &audio_vae,
-        &tts_device,
-        &audio_device,
+        tts_device,
+        audio_device,
+    );
+    let t_gen = t_gen_start.elapsed();
+
+    let t_convert_start = Instant::now();
+    let wav: Vec<f32> = wav.cast(DType::F32).to_data().to_vec().unwrap();
+    let t_convert = t_convert_start.elapsed();
+
+    let spec = hound::WavSpec {
+        channels: 1,
+        sample_rate: audio_vae.sample_rate as u32,
+        bits_per_sample: 16,
+        sample_format: hound::SampleFormat::Int,
+    };
+    let mut writer =
+        hound::WavWriter::create(args.output_path.as_deref().unwrap_or("output.wav"), spec)
+            .unwrap();
+
+    let t_write_start = Instant::now();
+    for s in wav.iter() {
+        let i = ((*s * (i16::MAX as f32)).clamp(i16::MIN as f32, i16::MAX as f32)).round() as i16;
+        writer.write_sample(i).unwrap();
+    }
+    let t_write = t_write_start.elapsed();
+    println!(
+        "Timing: generate_total={:.3}s wav_convert={:.3}s wav_write={:.3}s",
+        t_gen.as_secs_f64(),
+        t_convert.as_secs_f64(),
+        t_write.as_secs_f64()
+    );
+}
+
+fn run_f16(args: &Args, model_path: &Path, tts_device: &LibTorchDevice, audio_device: &LibTorchDevice) {
+    type BTts = backend::LibTorch<f16>;
+    let tts_config = VoxCPMConfig::load(model_path.join("config.json")).unwrap();
+    let mut tts: VoxCPM<BTts> = tts_config.init(tts_device);
+
+    let mut store = BurnpackStore::from_file(model_path.join("voxcpm.bpk"));
+    tts.load_from(&mut store)
+        .expect("couldn't load tts model from burnpack");
+
+    let mut audio_vae: AudioVae<BAud> = tts_config.audio_vae_config.init(audio_device);
+    let mut store = BurnpackStore::from_file(model_path.join("audiovae.bpk"));
+    audio_vae
+        .load_from(&mut store)
+        .expect("couldn't load audio_vae model from burnpack");
+
+    let prompt = match (&args.prompt_text, &args.prompt_wav_path) {
+        (Some(prompt_text), Some(prompt_wav_path)) => Some((
+            prompt_text.clone(),
+            Tensor::<BAud, 1>::from_floats(&read_wav(prompt_wav_path)[..], audio_device)
+                .unsqueeze(),
+        )),
+        (None, None) => None,
+        _ => panic!("provide none or both prompt text and prompt audio"),
+    };
+
+    let t_gen_start = Instant::now();
+    let wav = tts.generate_libtorch(
+        args.target_text
+            .as_deref()
+            .unwrap_or("VoxCPM Tokenizer Free TTS for Context Aware Speech Generation and True to Life Voice Cloning"),
+        prompt,
+        &model_path.join("tokenizer.json"),
+        args.min_len,
+        args.max_len,
+        args.inference_timesteps,
+        args.cfg_value,
+        args.retry_badcase.unwrap_or(false),
+        args.retry_badcase_max_times.unwrap_or(3),
+        args.retry_badcase_ratio_threshold.unwrap_or(6.0),
+        false,
+        false,
+        &audio_vae,
+        tts_device,
+        audio_device,
     );
     let t_gen = t_gen_start.elapsed();
 
@@ -223,6 +322,14 @@ fn parse_device_override(device: &str) -> LibTorchDevice {
         }
     }
     LibTorchDevice::Cpu
+}
+
+fn resolve_model_path(model_path: &str, tts_dtype: TtsDtype) -> std::path::PathBuf {
+    let base = Path::new(model_path);
+    match base.file_name().and_then(|name| name.to_str()) {
+        Some(name) if name == tts_dtype.as_str() => base.to_path_buf(),
+        _ => base.join(tts_dtype.as_str()),
+    }
 }
 
 fn main() {

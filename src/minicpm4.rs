@@ -1,3 +1,6 @@
+use std::sync::OnceLock;
+use std::time::{Duration, Instant};
+
 use burn::{
     nn::{Embedding, RmsNorm, RmsNormConfig},
     prelude::*,
@@ -111,21 +114,55 @@ impl<B: Backend> MiniCPMModel<B> {
         is_causal: bool,
     ) -> (Tensor<B, 3>, Vec<(Tensor<B, 4>, Tensor<B, 4>)>) {
         //vdbg!(&inputs_embeds);
+        let timing_mode = layer_timing_mode();
+        let enable_timings = timing_mode.is_some();
+        let per_layer = matches!(
+            timing_mode,
+            Some("per-layer") | Some("layers") | Some("deep")
+        );
+        let start_total = enable_timings.then(Instant::now);
+        let start_rope = enable_timings.then(Instant::now);
         let position_ids =
             Tensor::arange(0..inputs_embeds.dims()[1] as i64, &inputs_embeds.device());
         let position_emb = self.rope_emb.forward(position_ids.clone().unsqueeze());
+        let rope_time = start_rope.map(|t| t.elapsed());
         let mut hidden_states = inputs_embeds;
 
         let mut next_decoder_cache = Vec::new();
 
-        for decoder_layer in &self.layers {
+        let mut layers_time = Duration::ZERO;
+        for (layer_index, decoder_layer) in self.layers.iter().enumerate() {
+            let layer_start = enable_timings.then(Instant::now);
             let ret = decoder_layer.forward(hidden_states, position_emb.clone(), is_causal);
             hidden_states = ret.0;
             let key_cache = ret.1;
             let value_cache = ret.2;
             next_decoder_cache.push((key_cache, value_cache));
+            if let Some(layer_start) = layer_start {
+                let elapsed = layer_start.elapsed();
+                layers_time += elapsed;
+                if per_layer {
+                    println!(
+                        "MiniCPM layer timing: layer={} total={:.6}s",
+                        layer_index,
+                        elapsed.as_secs_f64()
+                    );
+                }
+            }
         }
+        let start_norm = enable_timings.then(Instant::now);
         let hidden_states = self.norm.forward(hidden_states);
+        let norm_time = start_norm.map(|t| t.elapsed());
+
+        if let Some(start_total) = start_total {
+            println!(
+                "MiniCPM timing: total={:.6}s rope={:.6}s layers={:.6}s norm={:.6}s",
+                start_total.elapsed().as_secs_f64(),
+                rope_time.map(|d| d.as_secs_f64()).unwrap_or(0.0),
+                layers_time.as_secs_f64(),
+                norm_time.map(|d| d.as_secs_f64()).unwrap_or(0.0),
+            );
+        }
 
         (hidden_states, next_decoder_cache)
     }
@@ -155,6 +192,12 @@ impl<B: Backend> MiniCPMModel<B> {
 
         self.norm.forward(hidden_states)
     }
+}
+
+fn layer_timing_mode() -> Option<&'static str> {
+    static MODE: OnceLock<Option<String>> = OnceLock::new();
+    MODE.get_or_init(|| std::env::var("VOXCPM_LAYER_TIMINGS").ok())
+        .as_deref()
 }
 
 #[derive(Debug, Config)]

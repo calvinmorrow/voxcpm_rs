@@ -1,4 +1,11 @@
-use std::{marker::PhantomData, path::Path, time::Instant};
+use std::{
+    any::TypeId,
+    marker::PhantomData,
+    path::Path,
+    sync::OnceLock,
+    time::Duration,
+    time::Instant,
+};
 
 use burn::{
     Tensor,
@@ -9,7 +16,7 @@ use burn::{
     tensor::{
         DType, Distribution, Int,
         activation::{silu, tanh},
-        bf16,
+        bf16, f16,
         ops::PadMode,
     },
 };
@@ -248,8 +255,12 @@ impl<B: Backend> VoxCPM<B> {
                 .permute([1, 2, 0]);
 
             let audio_feat = audio_feat.slice([s![..-1], s![..], s![..]]);
-            let audio_feat =
-                Tensor::<B, 3>::from_data(audio_feat.to_data().convert_dtype(DType::BF16), device);
+            let audio_feat = Tensor::<B, 3>::from_data(
+                audio_feat
+                    .to_data()
+                    .convert_dtype(float_dtype_for_backend::<B>()),
+                device,
+            );
             let audio_length = audio_feat.dims()[0];
             let text_pad_token: Tensor<B, 1, Int> = Tensor::zeros([audio_length], device);
 
@@ -613,6 +624,86 @@ impl VoxCPM<backend::LibTorch<bf16>> {
     }
 }
 
+impl VoxCPM<backend::LibTorch<f16>> {
+    pub fn generate_libtorch(
+        &mut self,
+        target_text: &str,
+        prompt: Option<(String, Tensor<backend::LibTorch<f32>, 2>)>,
+        tokenizer_path: &Path,
+        min_len: Option<usize>,
+        max_len: Option<usize>,
+        inference_timesteps: Option<usize>,
+        cfg_value: Option<f32>,
+        retry_badcase: bool,
+        retry_badcase_max_times: usize,
+        retry_badcase_ratio_threshold: f32,
+        _debug: bool,
+        _stop_on_zero: bool,
+        audio_vae: &AudioVae<backend::LibTorch<f32>>,
+        device: &<backend::LibTorch<f16> as Backend>::Device,
+        adevice: &<backend::LibTorch<f32> as Backend>::Device,
+    ) -> Tensor<backend::LibTorch<f32>, 1> {
+        let t_start = Instant::now();
+        let latent_pred = self.generate_latent(
+            target_text,
+            prompt,
+            tokenizer_path,
+            min_len,
+            max_len,
+            inference_timesteps,
+            cfg_value,
+            retry_badcase,
+            retry_badcase_max_times,
+            retry_badcase_ratio_threshold,
+            _debug,
+            _stop_on_zero,
+            audio_vae,
+            device,
+            adevice,
+        );
+        let t_latent = t_start.elapsed();
+
+        // Keep the cast and device move on GPU to avoid CPU round-trips.
+        let primitive = latent_pred.into_primitive();
+        let tensor = primitive
+            .tensor()
+            .tensor
+            .to_device((*adevice).into())
+            .to_kind(tch::Kind::Float);
+        let latent_pred = Tensor::from_primitive(TensorPrimitive::Float(
+            burn::backend::libtorch::TchTensor::new(tensor),
+        ));
+
+        let t_decode_start = Instant::now();
+        println!("Device check: latent_pred={:?}", latent_pred.device());
+        println!("Device check: audio_vae={:?}", audio_vae.device());
+        let decode_audio = audio_vae.decode(latent_pred).squeeze_dim::<2>(0);
+        let t_decode = t_decode_start.elapsed();
+        println!(
+            "Timing: latent_gen={:.3}s decode={:.3}s",
+            t_latent.as_secs_f64(),
+            t_decode.as_secs_f64()
+        );
+        decode_audio.slice([s![..], s![640..-640]]).squeeze()
+    }
+}
+
+fn float_dtype_for_backend<B: Backend>() -> DType {
+    if TypeId::of::<B::FloatElem>() == TypeId::of::<bf16>() {
+        DType::BF16
+    } else if TypeId::of::<B::FloatElem>() == TypeId::of::<f16>() {
+        DType::F16
+    } else {
+        DType::F32
+    }
+}
+
+fn layer_timing_mode() -> Option<&'static str> {
+    static MODE: OnceLock<Option<String>> = OnceLock::new();
+    MODE.get_or_init(|| std::env::var("VOXCPM_LAYER_TIMINGS").ok())
+        .as_deref()
+}
+
 #[derive(Debug, Config)]
 pub struct VoxCPMLocEncConfig {
     #[config(default = 1024)]
@@ -828,12 +919,25 @@ impl<B: Backend> UnifiedCFM<B> {
             .iter()
             .max()
             .unwrap();
+        let timing_mode = std::env::var("VOXCPM_STEP_TIMINGS").ok();
+        let per_step = matches!(timing_mode.as_deref(), Some("per-step") | Some("steps"));
+        let enable_timings = timing_mode.is_some();
+        let mut total_step = Duration::ZERO;
+        let mut total_prep = Duration::ZERO;
+        let mut total_forward = Duration::ZERO;
+        let mut total_update = Duration::ZERO;
+        let mut measured_steps = 0usize;
 
         for step in 1..t_span_len {
+            let step_start = enable_timings.then(Instant::now);
+            let mut prep_time = Duration::ZERO;
+            let mut forward_time = Duration::ZERO;
+            let mut update_time = Duration::ZERO;
             let dphi_dt = if use_cfg_zero_star && step <= zero_init_steps {
                 None
             } else {
                 let b = x.dims()[0];
+                let prep_start = enable_timings.then(Instant::now);
                 let x_in = Tensor::zeros([2 * b, self.in_channels, x.dims()[2]], &mu.device());
                 let mu_in = Tensor::zeros([2 * b, mu.dims()[1]], &mu.device());
                 let t_in = Tensor::zeros([2 * b], &mu.device());
@@ -859,8 +963,15 @@ impl<B: Backend> UnifiedCFM<B> {
                 let cond_in = cond_in
                     .clone()
                     .slice_assign([s![b..], s![..], s![..]], cond.clone());
+                if let Some(prep_start) = prep_start {
+                    prep_time = prep_start.elapsed();
+                }
                 //VoxCPMLocDiT torch.Size([2, 64, 2]) torch.Size([2, 1024]) torch.Size([2]) torch.Size([2, 64, 2]) torch.Size([2])
+                let forward_start = enable_timings.then(Instant::now);
                 let dphi_dt_data = self.estimator.forward(x_in, mu_in, t_in, cond_in, dt_in);
+                if let Some(forward_start) = forward_start {
+                    forward_time = forward_start.elapsed();
+                }
                 let data = dphi_dt_data.split(x.dims()[0], 0);
                 let dphi_dt_data = data[0].clone();
                 let cfg_dphi_dt_data = data[1].clone();
@@ -890,6 +1001,7 @@ impl<B: Backend> UnifiedCFM<B> {
                 };
                 Some(dphi_dt)
             };
+            let update_start = enable_timings.then(Instant::now);
             x = match dphi_dt {
                 Some(val) => x - dt.clone().unsqueeze() * val,
                 None => x,
@@ -902,6 +1014,38 @@ impl<B: Backend> UnifiedCFM<B> {
                         .clone()
                         .select(0, Tensor::from_data([step + 1], &mu.device()));
             }
+            if let Some(update_start) = update_start {
+                update_time = update_start.elapsed();
+            }
+            if let Some(step_start) = step_start {
+                let step_elapsed = step_start.elapsed();
+                total_step += step_elapsed;
+                total_prep += prep_time;
+                total_forward += forward_time;
+                total_update += update_time;
+                measured_steps += 1;
+                if per_step {
+                    println!(
+                        "Step timing: step={} total={:.6}s prep={:.6}s forward={:.6}s update={:.6}s",
+                        step,
+                        step_elapsed.as_secs_f64(),
+                        prep_time.as_secs_f64(),
+                        forward_time.as_secs_f64(),
+                        update_time.as_secs_f64()
+                    );
+                }
+            }
+        }
+        if enable_timings && measured_steps > 0 {
+            let steps = measured_steps as f64;
+            println!(
+                "Euler timing: steps={} avg_step={:.6}s avg_prep={:.6}s avg_forward={:.6}s avg_update={:.6}s",
+                measured_steps,
+                total_step.as_secs_f64() / steps,
+                total_prep.as_secs_f64() / steps,
+                total_forward.as_secs_f64() / steps,
+                total_update.as_secs_f64() / steps
+            );
         }
         sol.last().unwrap().clone()
     }
@@ -971,24 +1115,50 @@ impl<B: Backend> VoxCPMLocDiT<B> {
     ) -> Tensor<B, 3> {
         //vdbg!(&x, &mu, &t, &cond, &dt);
         //VoxCPMLocDiT torch.Size([2, 64, 2]) torch.Size([2, 1024]) torch.Size([2]) torch.Size([2, 64, 2]) torch.Size([2])
+        let timing_mode = layer_timing_mode();
+        let enable_timings = timing_mode.is_some();
+        let start_total = enable_timings.then(Instant::now);
+
+        let start_in_proj = enable_timings.then(Instant::now);
         let x = self.in_proj.forward(x.swap_dims(1, 2));
+        let in_proj_time = start_in_proj.map(|t| t.elapsed());
+
+        let start_cond_proj = enable_timings.then(Instant::now);
         let cond = self.cond_proj.forward(cond.swap_dims(1, 2));
+        let cond_proj_time = start_cond_proj.map(|t| t.elapsed());
         let prefix = cond.dims()[1];
 
+        let start_time_emb = enable_timings.then(Instant::now);
         let t = self.time_embeddings.forward(t, None).cast(x.dtype());
         let t = self.time_mlp.forward(t);
         let dt = self.time_embeddings.forward(dt, None).cast(x.dtype());
         let dt = self.delta_time_mlp.forward(dt);
         let t = t + dt;
+        let time_emb_time = start_time_emb.map(|t| t.elapsed());
 
         let x = Tensor::cat(vec![(mu + t.unsqueeze()).unsqueeze_dim(1), cond, x], 1);
 
+        let start_decoder = enable_timings.then(Instant::now);
         let (hidden, _) = self.decoder.forward(x, false);
+        let decoder_time = start_decoder.map(|t| t.elapsed());
         let hidden = hidden.slice([s![..], s![prefix + 1..], s![..]]);
+        let start_out_proj = enable_timings.then(Instant::now);
         let hidden = self.out_proj.forward(hidden);
+        let out_proj_time = start_out_proj.map(|t| t.elapsed());
 
         //VoxCPMLocDiT x: (2, 64, 2), mu: (2, 1024), t: (2,), cond: (2, 64, 2), dt: (2,)
         //VoxCPMLocDiT out: (2, 64, 2)
+        if let Some(start_total) = start_total {
+            println!(
+                "DiT timing: total={:.6}s in_proj={:.6}s cond_proj={:.6}s time_embed={:.6}s decoder={:.6}s out_proj={:.6}s",
+                start_total.elapsed().as_secs_f64(),
+                in_proj_time.map(|d| d.as_secs_f64()).unwrap_or(0.0),
+                cond_proj_time.map(|d| d.as_secs_f64()).unwrap_or(0.0),
+                time_emb_time.map(|d| d.as_secs_f64()).unwrap_or(0.0),
+                decoder_time.map(|d| d.as_secs_f64()).unwrap_or(0.0),
+                out_proj_time.map(|d| d.as_secs_f64()).unwrap_or(0.0),
+            );
+        }
         hidden.swap_dims(1, 2)
     }
 }

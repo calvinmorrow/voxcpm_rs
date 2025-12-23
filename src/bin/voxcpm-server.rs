@@ -11,7 +11,7 @@ use axum::{Json, Router};
 use burn::backend::libtorch::LibTorchDevice;
 use burn::backend::{self};
 use burn::prelude::*;
-use burn::tensor::{DType, bf16};
+use burn::tensor::{DType, bf16, f16};
 use burn_store::{BurnpackStore, ModuleSnapshot};
 use clap::Parser;
 use tokio::sync::{Mutex, Semaphore};
@@ -30,29 +30,53 @@ use voxcpm_rs::voice_registry::{
 };
 use voxcpm_rs::voxcpm::{VoxCPM, VoxCPMConfig};
 
-type BTts = backend::LibTorch<bf16>;
 type BAud = backend::LibTorch<f32>;
 
 #[derive(Parser, Debug)]
 #[command(version, about, long_about = None)]
 struct Args {
-    #[arg(long)]
+    #[arg(long, default_value = "burn-models")]
     model_path: String,
+    #[arg(long, value_enum, default_value = "bf16")]
+    tts_dtype: TtsDtype,
     #[arg(long, default_value = "0.0.0.0")]
     host: String,
     #[arg(long, default_value_t = 8000)]
     port: u16,
     #[arg(long)]
     device: Option<String>,
+    #[arg(long)]
+    inference_timesteps: Option<usize>,
     #[arg(long, default_value = "voices/registry.json")]
     registry_path: String,
     #[arg(long, default_value_t = 1)]
     max_concurrency: usize,
 }
 
-struct ModelState {
-    tts: VoxCPM<BTts>,
-    audio_vae: AudioVae<BAud>,
+#[derive(clap::ValueEnum, Clone, Copy, Debug)]
+enum TtsDtype {
+    Bf16,
+    F16,
+}
+
+impl TtsDtype {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Bf16 => "bf16",
+            Self::F16 => "f16",
+        }
+    }
+}
+
+enum ModelState {
+    Bf16 {
+        tts: VoxCPM<backend::LibTorch<bf16>>,
+        audio_vae: AudioVae<BAud>,
+    },
+    F16 {
+        tts: VoxCPM<backend::LibTorch<f16>>,
+        audio_vae: AudioVae<BAud>,
+    },
 }
 
 #[derive(Clone)]
@@ -65,6 +89,7 @@ struct AppState {
     registry_path: PathBuf,
     voices_dir: PathBuf,
     base_dir: PathBuf,
+    inference_timesteps: Option<usize>,
     semaphore: Arc<Semaphore>,
 }
 
@@ -85,24 +110,42 @@ async fn main() {
     let tts_device = select_device(args.device.as_deref());
     let audio_device = select_device(args.device.as_deref());
 
-    let model_path = Path::new(&args.model_path);
+    let model_path = resolve_model_path(&args.model_path, args.tts_dtype);
     let tokenizer_path = model_path.join("tokenizer.json");
 
     let tts_config =
         VoxCPMConfig::load(model_path.join("config.json")).expect("failed to load config.json");
-    let mut tts: VoxCPM<BTts> = tts_config.init(&tts_device);
 
-    let mut store = BurnpackStore::from_file(model_path.join("voxcpm.bpk"));
-    tts.load_from(&mut store)
-        .expect("failed to load voxcpm.bpk");
+    let model = match args.tts_dtype {
+        TtsDtype::Bf16 => {
+            let mut tts: VoxCPM<backend::LibTorch<bf16>> = tts_config.init(&tts_device);
+            let mut store = BurnpackStore::from_file(model_path.join("voxcpm.bpk"));
+            tts.load_from(&mut store)
+                .expect("failed to load voxcpm.bpk");
 
-    let mut audio_vae: AudioVae<BAud> = tts_config.audio_vae_config.init(&audio_device);
-    let mut store = BurnpackStore::from_file(model_path.join("audiovae.bpk"));
-    audio_vae
-        .load_from(&mut store)
-        .expect("failed to load audiovae.bpk");
+            let mut audio_vae: AudioVae<BAud> = tts_config.audio_vae_config.init(&audio_device);
+            let mut store = BurnpackStore::from_file(model_path.join("audiovae.bpk"));
+            audio_vae
+                .load_from(&mut store)
+                .expect("failed to load audiovae.bpk");
 
-    let model = Arc::new(Mutex::new(ModelState { tts, audio_vae }));
+            Arc::new(Mutex::new(ModelState::Bf16 { tts, audio_vae }))
+        }
+        TtsDtype::F16 => {
+            let mut tts: VoxCPM<backend::LibTorch<f16>> = tts_config.init(&tts_device);
+            let mut store = BurnpackStore::from_file(model_path.join("voxcpm.bpk"));
+            tts.load_from(&mut store)
+                .expect("failed to load voxcpm.bpk");
+
+            let mut audio_vae: AudioVae<BAud> = tts_config.audio_vae_config.init(&audio_device);
+            let mut store = BurnpackStore::from_file(model_path.join("audiovae.bpk"));
+            audio_vae
+                .load_from(&mut store)
+                .expect("failed to load audiovae.bpk");
+
+            Arc::new(Mutex::new(ModelState::F16 { tts, audio_vae }))
+        }
+    };
 
     let state = AppState {
         model,
@@ -113,6 +156,7 @@ async fn main() {
         registry_path,
         voices_dir,
         base_dir,
+        inference_timesteps: args.inference_timesteps,
         semaphore: Arc::new(Semaphore::new(args.max_concurrency)),
     };
 
@@ -308,31 +352,53 @@ async fn handle_speech(
     let prompt = Some((voice.transcript.clone(), prompt_tensor));
 
     let mut model = state.model.lock().await;
-    let ModelState { tts, audio_vae } = &mut *model;
-    let wav = tts.generate_libtorch(
-        &request.input,
-        prompt,
-        &state.tokenizer_path,
-        None,
-        None,
-        None,
-        None,
-        false,
-        3,
-        6.0,
-        false,
-        false,
-        &*audio_vae,
-        &state.tts_device,
-        &state.audio_device,
-    );
+    let (wav, sample_rate) = match &mut *model {
+        ModelState::Bf16 { tts, audio_vae } => {
+            let wav = tts.generate_libtorch(
+                &request.input,
+                prompt,
+                &state.tokenizer_path,
+                None,
+                None,
+                state.inference_timesteps,
+                None,
+                false,
+                3,
+                6.0,
+                false,
+                false,
+                &*audio_vae,
+                &state.tts_device,
+                &state.audio_device,
+            );
+            (wav, audio_vae.sample_rate as u32)
+        }
+        ModelState::F16 { tts, audio_vae } => {
+            let wav = tts.generate_libtorch(
+                &request.input,
+                prompt,
+                &state.tokenizer_path,
+                None,
+                None,
+                state.inference_timesteps,
+                None,
+                false,
+                3,
+                6.0,
+                false,
+                false,
+                &*audio_vae,
+                &state.tts_device,
+                &state.audio_device,
+            );
+            (wav, audio_vae.sample_rate as u32)
+        }
+    };
     let wav: Vec<f32> = wav
         .cast(DType::F32)
         .to_data()
         .to_vec()
         .map_err(|_| ApiError::server_error("failed to convert wav tensor"))?;
-
-    let sample_rate = audio_vae.sample_rate as u32;
     let audio_len = if sample_rate == 0 {
         0.0
     } else {
@@ -365,6 +431,14 @@ async fn handle_speech(
         .headers_mut()
         .insert(header::CONTENT_TYPE, HeaderValue::from_static(content_type));
     Ok(response)
+}
+
+fn resolve_model_path(model_path: &str, tts_dtype: TtsDtype) -> PathBuf {
+    let base = Path::new(model_path);
+    match base.file_name().and_then(|name| name.to_str()) {
+        Some(name) if name == tts_dtype.as_str() => base.to_path_buf(),
+        _ => base.join(tts_dtype.as_str()),
+    }
 }
 
 async fn select_voice(state: &AppState, voice: Option<&str>) -> Result<VoiceEntry, ApiError> {
