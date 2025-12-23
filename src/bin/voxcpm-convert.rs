@@ -78,7 +78,8 @@ fn convert(input_path: &str, output_path: &str, device: Option<&str>, tts_dtype:
                     .expect("couldn't load safetensors tts model")
             );
             let tts = cast_module_float_dtype(tts, DType::BF16);
-            let mut store = BurnpackStore::from_file(output_path.join("voxcpm.bpk")).overwrite(true);
+            let mut store =
+                BurnpackStore::from_file(output_path.join("voxcpm.bpk")).overwrite(true);
             println!(
                 "{:?}",
                 tts.save_into(&mut store)
@@ -100,7 +101,8 @@ fn convert(input_path: &str, output_path: &str, device: Option<&str>, tts_dtype:
                     .expect("couldn't load safetensors tts model")
             );
             let tts = cast_module_float_dtype(tts, DType::F16);
-            let mut store = BurnpackStore::from_file(output_path.join("voxcpm.bpk")).overwrite(true);
+            let mut store =
+                BurnpackStore::from_file(output_path.join("voxcpm.bpk")).overwrite(true);
             println!(
                 "{:?}",
                 tts.save_into(&mut store)

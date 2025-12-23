@@ -289,7 +289,7 @@
             <pre id="voices-response">Loading…</pre>
           </div>
           <div>
-            <div class="section-title">Chatterbox Voices (/v1/audio/chatterbox/voices)</div>
+            <div class="section-title">Chatterbox Voices (/v1/audio/voices/chatterbox)</div>
             <pre id="chatterbox-response">Loading…</pre>
           </div>
         </div>
@@ -360,7 +360,7 @@
         const voicesResult = await fetchJson("/v1/voices");
         voicesResponse.textContent =
           voicesResult.text || "(empty response)";
-        const chatterboxResult = await fetchJson("/v1/audio/chatterbox/voices");
+        const chatterboxResult = await fetchJson("/v1/audio/voices/chatterbox");
         chatterboxResponse.textContent =
           chatterboxResult.text || "(empty response)";
 

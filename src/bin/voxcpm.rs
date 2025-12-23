@@ -75,7 +75,12 @@ fn run(args: Args) {
     }
 }
 
-fn run_bf16(args: &Args, model_path: &Path, tts_device: &LibTorchDevice, audio_device: &LibTorchDevice) {
+fn run_bf16(
+    args: &Args,
+    model_path: &Path,
+    tts_device: &LibTorchDevice,
+    audio_device: &LibTorchDevice,
+) {
     type BTts = backend::LibTorch<bf16>;
     let tts_config = VoxCPMConfig::load(model_path.join("config.json")).unwrap();
     let mut tts: VoxCPM<BTts> = tts_config.init(tts_device);
@@ -150,7 +155,12 @@ fn run_bf16(args: &Args, model_path: &Path, tts_device: &LibTorchDevice, audio_d
     );
 }
 
-fn run_f16(args: &Args, model_path: &Path, tts_device: &LibTorchDevice, audio_device: &LibTorchDevice) {
+fn run_f16(
+    args: &Args,
+    model_path: &Path,
+    tts_device: &LibTorchDevice,
+    audio_device: &LibTorchDevice,
+) {
     type BTts = backend::LibTorch<f16>;
     let tts_config = VoxCPMConfig::load(model_path.join("config.json")).unwrap();
     let mut tts: VoxCPM<BTts> = tts_config.init(tts_device);

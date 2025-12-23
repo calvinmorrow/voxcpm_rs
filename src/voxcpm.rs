@@ -1,10 +1,5 @@
 use std::{
-    any::TypeId,
-    marker::PhantomData,
-    path::Path,
-    sync::OnceLock,
-    time::Duration,
-    time::Instant,
+    any::TypeId, marker::PhantomData, path::Path, sync::OnceLock, time::Duration, time::Instant,
 };
 
 use burn::{

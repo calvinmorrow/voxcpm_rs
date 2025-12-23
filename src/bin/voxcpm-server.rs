@@ -3,8 +3,11 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use axum::body::Body;
+use axum::extract::Request;
 use axum::extract::{Multipart, State};
-use axum::http::{HeaderValue, StatusCode, header};
+use axum::http::{HeaderValue, Method, StatusCode, header};
+use axum::middleware::{self, Next};
+use axum::response::Response as AxumResponse;
 use axum::response::{Html, IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
@@ -167,9 +170,10 @@ async fn main() {
             "/v1/voices",
             post(handle_upload_voice).get(handle_list_voices),
         )
-        .route("/v1/audio/chatterbox/voices", get(handle_chatterbox_voices))
+        .route("/v1/audio/voices/chatterbox", get(handle_chatterbox_voices))
         .route("/healthz", get(handle_healthz))
         .route("/v1/models", get(handle_models))
+        .layer(middleware::from_fn(cors_middleware))
         .with_state(state);
 
     let addr = format!("{}:{}", args.host, args.port);
@@ -188,6 +192,33 @@ async fn handle_index() -> impl IntoResponse {
 
 async fn handle_healthz() -> impl IntoResponse {
     (StatusCode::OK, "ok")
+}
+
+async fn cors_middleware(request: Request, next: Next) -> Result<AxumResponse, ApiError> {
+    if request.method() == Method::OPTIONS {
+        let mut response = AxumResponse::new(Body::empty());
+        *response.status_mut() = StatusCode::NO_CONTENT;
+        add_cors_headers(response.headers_mut());
+        return Ok(response);
+    }
+    let mut response = next.run(request).await;
+    add_cors_headers(response.headers_mut());
+    Ok(response)
+}
+
+fn add_cors_headers(headers: &mut axum::http::HeaderMap) {
+    headers.insert(
+        header::ACCESS_CONTROL_ALLOW_ORIGIN,
+        HeaderValue::from_static("*"),
+    );
+    headers.insert(
+        header::ACCESS_CONTROL_ALLOW_METHODS,
+        HeaderValue::from_static("GET,POST,OPTIONS"),
+    );
+    headers.insert(
+        header::ACCESS_CONTROL_ALLOW_HEADERS,
+        HeaderValue::from_static("content-type,cache-control"),
+    );
 }
 
 async fn handle_models() -> impl IntoResponse {
@@ -469,8 +500,26 @@ async fn select_voice(state: &AppState, voice: Option<&str>) -> Result<VoiceEntr
             .ok_or_else(|| ApiError::bad_request("no voices available")),
         Some(voice_id) => registry
             .get_voice(voice_id)
+            .or_else(|| find_voice_by_wav_name(&registry, voice_id))
             .ok_or_else(|| ApiError::bad_request("unknown voice_id").with_param("voice")),
     }
+}
+
+fn find_voice_by_wav_name(registry: &VoiceRegistry, voice: &str) -> Option<VoiceEntry> {
+    let requested = Path::new(voice)
+        .file_name()
+        .map(|name| name.to_string_lossy().to_ascii_lowercase())
+        .unwrap_or_else(|| voice.to_ascii_lowercase());
+    for entry in &registry.voices {
+        let name = Path::new(&entry.wav_path)
+            .file_name()
+            .map(|name| name.to_string_lossy().to_ascii_lowercase())
+            .unwrap_or_else(|| entry.wav_path.to_ascii_lowercase());
+        if name == requested {
+            return Some(entry.clone());
+        }
+    }
+    None
 }
 
 fn resolve_path(base_dir: &Path, path: &str) -> PathBuf {
