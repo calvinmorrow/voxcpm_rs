@@ -52,4 +52,4 @@ COPY static LICENSE /app/static
 COPY --from=build /app/target/release/voxcpm* /app/
 
 ENTRYPOINT ["/usr/bin/dumb-init", "--"]
-CMD ["/app/voxcpm-server"]
+CMD ["/app/voxcpm-server", "--warm-cache"]

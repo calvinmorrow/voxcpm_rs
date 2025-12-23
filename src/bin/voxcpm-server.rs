@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Instant;
@@ -31,7 +32,7 @@ use voxcpm_rs::openai_types::{
 use voxcpm_rs::voice_registry::{
     VoiceEntry, VoiceRegistry, generate_voice_id, load_registry, save_registry,
 };
-use voxcpm_rs::voxcpm::{VoxCPM, VoxCPMConfig};
+use voxcpm_rs::voxcpm::{PromptFeatures, VoxCPM, VoxCPMConfig};
 
 type BAud = backend::LibTorch<f32>;
 
@@ -54,6 +55,8 @@ struct Args {
     registry_path: String,
     #[arg(long, default_value_t = 1)]
     max_concurrency: usize,
+    #[arg(long, default_value_t = false)]
+    warm_cache: bool,
 }
 
 #[derive(clap::ValueEnum, Clone, Copy, Debug)]
@@ -83,12 +86,19 @@ enum ModelState {
 }
 
 #[derive(Clone)]
+enum PromptCacheEntry {
+    Bf16(PromptFeatures<backend::LibTorch<bf16>>),
+    F16(PromptFeatures<backend::LibTorch<f16>>),
+}
+
+#[derive(Clone)]
 struct AppState {
     model: Arc<Mutex<ModelState>>,
     tokenizer_path: PathBuf,
     tts_device: LibTorchDevice,
     audio_device: LibTorchDevice,
     registry: Arc<Mutex<VoiceRegistry>>,
+    prompt_cache: Arc<Mutex<HashMap<String, PromptCacheEntry>>>,
     registry_path: PathBuf,
     voices_dir: PathBuf,
     base_dir: PathBuf,
@@ -156,12 +166,17 @@ async fn main() {
         tts_device,
         audio_device,
         registry,
+        prompt_cache: Arc::new(Mutex::new(HashMap::new())),
         registry_path,
         voices_dir,
         base_dir,
         inference_timesteps: args.inference_timesteps,
         semaphore: Arc::new(Semaphore::new(args.max_concurrency)),
     };
+
+    if args.warm_cache {
+        warm_prompt_cache(&state).await;
+    }
 
     let app = Router::new()
         .route("/", get(handle_index))
@@ -192,6 +207,66 @@ async fn handle_index() -> impl IntoResponse {
 
 async fn handle_healthz() -> impl IntoResponse {
     (StatusCode::OK, "ok")
+}
+
+async fn warm_prompt_cache(state: &AppState) {
+    let voices = {
+        let registry = state.registry.lock().await;
+        registry.voices.clone()
+    };
+    if voices.is_empty() {
+        println!("prompt_cache: warm skipped (no voices)");
+        return;
+    }
+
+    println!("prompt_cache: warming {} voice(s)", voices.len());
+    for voice in voices {
+        let should_skip = {
+            let cache = state.prompt_cache.lock().await;
+            cache.contains_key(&voice.voice_id)
+        };
+        if should_skip {
+            continue;
+        }
+
+        let prompt_tensor = match load_prompt_tensor(state, &voice) {
+            Ok(tensor) => tensor,
+            Err(err) => {
+                eprintln!(
+                    "prompt_cache: warm failed voice_id={} err={:?}",
+                    voice.voice_id, err
+                );
+                continue;
+            }
+        };
+
+        let cache_entry = {
+            let mut model = state.model.lock().await;
+            match &mut *model {
+                ModelState::Bf16 { tts, audio_vae } => {
+                    let features = tts.build_prompt_features(
+                        voice.transcript.clone(),
+                        prompt_tensor.clone(),
+                        &*audio_vae,
+                        &state.tts_device,
+                    );
+                    PromptCacheEntry::Bf16(features)
+                }
+                ModelState::F16 { tts, audio_vae } => {
+                    let features = tts.build_prompt_features(
+                        voice.transcript.clone(),
+                        prompt_tensor.clone(),
+                        &*audio_vae,
+                        &state.tts_device,
+                    );
+                    PromptCacheEntry::F16(features)
+                }
+            }
+        };
+        let mut cache = state.prompt_cache.lock().await;
+        cache.insert(voice.voice_id.clone(), cache_entry);
+        println!("prompt_cache: warmed voice_id={}", voice.voice_id);
+    }
 }
 
 async fn cors_middleware(request: Request, next: Next) -> Result<AxumResponse, ApiError> {
@@ -353,8 +428,18 @@ async fn handle_upload_voice(
     };
     registry.add_voice(entry.clone());
     save_registry(&state.registry_path, &registry).map_err(|err| ApiError::server_error(err))?;
+    state.prompt_cache.lock().await.clear();
 
     Ok(Json(entry))
+}
+
+fn load_prompt_tensor(state: &AppState, voice: &VoiceEntry) -> Result<Tensor<BAud, 2>, ApiError> {
+    let wav_path = resolve_path(&state.base_dir, &voice.wav_path);
+    let prompt_audio = decode_wav_file(&wav_path)
+        .map_err(|err| ApiError::server_error(format!("prompt wav read failed: {}", err)))?;
+    let prompt_samples = resample_mono_to_44100(&prompt_audio.samples, prompt_audio.sample_rate)
+        .map_err(|err| ApiError::server_error(format!("prompt resample failed: {}", err)))?;
+    Ok(Tensor::<BAud, 1>::from_floats(&prompt_samples[..], &state.audio_device).unsqueeze())
 }
 
 async fn handle_speech(
@@ -386,22 +471,36 @@ async fn handle_speech(
 
     let t_start = Instant::now();
     let voice = select_voice(&state, request.voice.as_deref()).await?;
-    let wav_path = resolve_path(&state.base_dir, &voice.wav_path);
-    let prompt_audio = decode_wav_file(&wav_path)
-        .map_err(|err| ApiError::server_error(format!("prompt wav read failed: {}", err)))?;
-    let prompt_samples = resample_mono_to_44100(&prompt_audio.samples, prompt_audio.sample_rate)
-        .map_err(|err| ApiError::server_error(format!("prompt resample failed: {}", err)))?;
+    let cached_entry = {
+        let cache = state.prompt_cache.lock().await;
+        cache.get(&voice.voice_id).cloned()
+    };
 
-    let prompt_tensor =
-        Tensor::<BAud, 1>::from_floats(&prompt_samples[..], &state.audio_device).unsqueeze();
-    let prompt = Some((voice.transcript.clone(), prompt_tensor));
-
+    let mut cache_insert: Option<PromptCacheEntry> = None;
     let mut model = state.model.lock().await;
     let (wav, sample_rate) = match &mut *model {
         ModelState::Bf16 { tts, audio_vae } => {
-            let wav = tts.generate_libtorch(
+            let prompt_features = match &cached_entry {
+                Some(PromptCacheEntry::Bf16(features)) => {
+                    println!("prompt_cache: hit voice_id={}", voice.voice_id);
+                    features.clone()
+                }
+                _ => {
+                    println!("prompt_cache: miss voice_id={}", voice.voice_id);
+                    let prompt_tensor = load_prompt_tensor(&state, &voice)?;
+                    let features = tts.build_prompt_features(
+                        voice.transcript.clone(),
+                        prompt_tensor,
+                        &*audio_vae,
+                        &state.tts_device,
+                    );
+                    cache_insert = Some(PromptCacheEntry::Bf16(features.clone()));
+                    features
+                }
+            };
+            let wav = tts.generate_libtorch_with_prompt_features(
                 &request.input,
-                prompt,
+                Some(&prompt_features),
                 &state.tokenizer_path,
                 None,
                 None,
@@ -416,12 +515,30 @@ async fn handle_speech(
                 &state.tts_device,
                 &state.audio_device,
             );
-            (wav, audio_vae.sample_rate as u32)
+            Ok((wav, audio_vae.sample_rate as u32))
         }
         ModelState::F16 { tts, audio_vae } => {
-            let wav = tts.generate_libtorch(
+            let prompt_features = match &cached_entry {
+                Some(PromptCacheEntry::F16(features)) => {
+                    println!("prompt_cache: hit voice_id={}", voice.voice_id);
+                    features.clone()
+                }
+                _ => {
+                    println!("prompt_cache: miss voice_id={}", voice.voice_id);
+                    let prompt_tensor = load_prompt_tensor(&state, &voice)?;
+                    let features = tts.build_prompt_features(
+                        voice.transcript.clone(),
+                        prompt_tensor,
+                        &*audio_vae,
+                        &state.tts_device,
+                    );
+                    cache_insert = Some(PromptCacheEntry::F16(features.clone()));
+                    features
+                }
+            };
+            let wav = tts.generate_libtorch_with_prompt_features(
                 &request.input,
-                prompt,
+                Some(&prompt_features),
                 &state.tokenizer_path,
                 None,
                 None,
@@ -436,9 +553,16 @@ async fn handle_speech(
                 &state.tts_device,
                 &state.audio_device,
             );
-            (wav, audio_vae.sample_rate as u32)
+            Ok((wav, audio_vae.sample_rate as u32))
         }
-    };
+    }?;
+    if let Some(entry) = cache_insert {
+        state
+            .prompt_cache
+            .lock()
+            .await
+            .insert(voice.voice_id.clone(), entry);
+    }
     let wav: Vec<f32> = wav
         .cast(DType::F32)
         .to_data()

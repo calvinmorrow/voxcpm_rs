@@ -147,8 +147,54 @@ pub struct VoxCPM<B: Backend> {
     pub stop_head: Linear<B>,
 }
 
+#[derive(Debug, Clone)]
+pub struct PromptFeatures<B: Backend> {
+    pub prompt_text: String,
+    pub audio_feat: Tensor<B, 3>,
+    pub audio_length: usize,
+}
+
 #[allow(clippy::too_many_arguments)]
 impl<B: Backend> VoxCPM<B> {
+    pub fn build_prompt_features<AB: Backend>(
+        &self,
+        prompt_text: String,
+        mut prompt_audio: Tensor<AB, 2>,
+        audio_vae: &AudioVae<AB>,
+        device: &B::Device,
+    ) -> PromptFeatures<B> {
+        let patch_len = self.patch_size * audio_vae.chunk_size;
+        let pad_size = prompt_audio.dims()[1] % patch_len;
+        if pad_size != 0 {
+            prompt_audio = Tensor::pad(
+                prompt_audio,
+                (0, patch_len - pad_size, 0, 0),
+                PadMode::Constant(0.0),
+            );
+        }
+
+        let audio_feat = audio_vae.encode(prompt_audio.unsqueeze(), Some(audio_vae.sample_rate));
+
+        let audio_feat = audio_feat
+            .reshape([audio_vae.latent_dim as i64, -1, self.patch_size as i64])
+            .permute([1, 2, 0]);
+
+        let audio_feat = audio_feat.slice([s![..-1], s![..], s![..]]);
+        let audio_feat = Tensor::<B, 3>::from_data(
+            audio_feat
+                .to_data()
+                .convert_dtype(float_dtype_for_backend::<B>()),
+            device,
+        );
+        let audio_length = audio_feat.dims()[0];
+
+        PromptFeatures {
+            prompt_text,
+            audio_feat,
+            audio_length,
+        }
+    }
+
     pub fn generate<AB: Backend>(
         &mut self,
         target_text: &str,
@@ -209,14 +255,54 @@ impl<B: Backend> VoxCPM<B> {
         device: &B::Device,
         _adevice: &AB::Device,
     ) -> Tensor<B, 3> {
+        self.generate_latent_with_prompt_features(
+            target_text,
+            prompt.as_ref().map(|(text, audio)| {
+                self.build_prompt_features(text.clone(), audio.clone(), audio_vae, device)
+            }),
+            tokenizer_path,
+            min_len,
+            max_len,
+            inference_timesteps,
+            cfg_value,
+            retry_badcase,
+            retry_badcase_max_times,
+            retry_badcase_ratio_threshold,
+            _debug,
+            _stop_on_zero,
+            audio_vae,
+            device,
+            _adevice,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn generate_latent_with_prompt_features<AB: Backend>(
+        &mut self,
+        target_text: &str,
+        prompt_features: Option<PromptFeatures<B>>,
+        tokenizer_path: &Path,
+        min_len: Option<usize>,
+        max_len: Option<usize>,
+        inference_timesteps: Option<usize>,
+        cfg_value: Option<f32>,
+        retry_badcase: bool,
+        retry_badcase_max_times: usize,
+        retry_badcase_ratio_threshold: f32,
+        _debug: bool,
+        _stop_on_zero: bool,
+        audio_vae: &AudioVae<AB>,
+        device: &B::Device,
+        _adevice: &AB::Device,
+    ) -> Tensor<B, 3> {
         let tokenizer = Tokenizer::from_file(tokenizer_path).unwrap();
         let text_token_in;
         let text_mask_in;
         let audio_feat_in;
         let audio_mask_in;
         let target_text_length;
-        if let Some((prompt_text, mut prompt_audio)) = prompt {
-            let text = prompt_text.to_string() + target_text;
+        if let Some(prompt_features) = prompt_features {
+            let text = prompt_features.prompt_text + target_text;
             let text_token_ids = tokenize_masked(&tokenizer, &text);
             let text_token_ids: Vec<usize> =
                 text_token_ids.into_iter().map(|id| id as usize).collect();
@@ -230,33 +316,7 @@ impl<B: Backend> VoxCPM<B> {
                 0,
             );
             let text_length = text_token.dims()[0];
-            //TODO take mean
-            //TODO resample
-            let patch_len = self.patch_size * audio_vae.chunk_size;
-            let pad_size = prompt_audio.dims()[1] % patch_len;
-            if pad_size != 0 {
-                prompt_audio = Tensor::pad(
-                    prompt_audio,
-                    (0, patch_len - pad_size, 0, 0),
-                    PadMode::Constant(0.0),
-                );
-            }
-
-            let audio_feat =
-                audio_vae.encode(prompt_audio.unsqueeze(), Some(audio_vae.sample_rate));
-
-            let audio_feat = audio_feat
-                .reshape([audio_vae.latent_dim as i64, -1, self.patch_size as i64])
-                .permute([1, 2, 0]);
-
-            let audio_feat = audio_feat.slice([s![..-1], s![..], s![..]]);
-            let audio_feat = Tensor::<B, 3>::from_data(
-                audio_feat
-                    .to_data()
-                    .convert_dtype(float_dtype_for_backend::<B>()),
-                device,
-            );
-            let audio_length = audio_feat.dims()[0];
+            let audio_length = prompt_features.audio_length;
             let text_pad_token: Tensor<B, 1, Int> = Tensor::zeros([audio_length], device);
 
             let text_token = Tensor::cat(vec![text_token, text_pad_token], 0);
@@ -264,7 +324,7 @@ impl<B: Backend> VoxCPM<B> {
             let audio_pad_feat =
                 Tensor::zeros([text_length, self.patch_size, audio_vae.latent_dim], device);
 
-            let audio_feat = Tensor::cat(vec![audio_pad_feat, audio_feat], 0);
+            let audio_feat = Tensor::cat(vec![audio_pad_feat, prompt_features.audio_feat], 0);
 
             let text_mask = Tensor::cat(
                 vec![
@@ -617,6 +677,68 @@ impl VoxCPM<backend::LibTorch<bf16>> {
         );
         decode_audio.slice([s![..], s![640..-640]]).squeeze()
     }
+
+    pub fn generate_libtorch_with_prompt_features(
+        &mut self,
+        target_text: &str,
+        prompt_features: Option<&PromptFeatures<backend::LibTorch<bf16>>>,
+        tokenizer_path: &Path,
+        min_len: Option<usize>,
+        max_len: Option<usize>,
+        inference_timesteps: Option<usize>,
+        cfg_value: Option<f32>,
+        retry_badcase: bool,
+        retry_badcase_max_times: usize,
+        retry_badcase_ratio_threshold: f32,
+        _debug: bool,
+        _stop_on_zero: bool,
+        audio_vae: &AudioVae<backend::LibTorch<f32>>,
+        device: &<backend::LibTorch<bf16> as Backend>::Device,
+        adevice: &<backend::LibTorch<f32> as Backend>::Device,
+    ) -> Tensor<backend::LibTorch<f32>, 1> {
+        let t_start = Instant::now();
+        let latent_pred = self.generate_latent_with_prompt_features(
+            target_text,
+            prompt_features.cloned(),
+            tokenizer_path,
+            min_len,
+            max_len,
+            inference_timesteps,
+            cfg_value,
+            retry_badcase,
+            retry_badcase_max_times,
+            retry_badcase_ratio_threshold,
+            _debug,
+            _stop_on_zero,
+            audio_vae,
+            device,
+            adevice,
+        );
+        let t_latent = t_start.elapsed();
+
+        // Keep the cast and device move on GPU to avoid CPU round-trips.
+        let primitive = latent_pred.into_primitive();
+        let tensor = primitive
+            .tensor()
+            .tensor
+            .to_device((*adevice).into())
+            .to_kind(tch::Kind::Float);
+        let latent_pred = Tensor::from_primitive(TensorPrimitive::Float(
+            burn::backend::libtorch::TchTensor::new(tensor),
+        ));
+
+        let t_decode_start = Instant::now();
+        println!("Device check: latent_pred={:?}", latent_pred.device());
+        println!("Device check: audio_vae={:?}", audio_vae.device());
+        let decode_audio = audio_vae.decode(latent_pred).squeeze_dim::<2>(0);
+        let t_decode = t_decode_start.elapsed();
+        println!(
+            "Timing: latent_gen={:.3}s decode={:.3}s",
+            t_latent.as_secs_f64(),
+            t_decode.as_secs_f64()
+        );
+        decode_audio.slice([s![..], s![640..-640]]).squeeze()
+    }
 }
 
 impl VoxCPM<backend::LibTorch<f16>> {
@@ -642,6 +764,68 @@ impl VoxCPM<backend::LibTorch<f16>> {
         let latent_pred = self.generate_latent(
             target_text,
             prompt,
+            tokenizer_path,
+            min_len,
+            max_len,
+            inference_timesteps,
+            cfg_value,
+            retry_badcase,
+            retry_badcase_max_times,
+            retry_badcase_ratio_threshold,
+            _debug,
+            _stop_on_zero,
+            audio_vae,
+            device,
+            adevice,
+        );
+        let t_latent = t_start.elapsed();
+
+        // Keep the cast and device move on GPU to avoid CPU round-trips.
+        let primitive = latent_pred.into_primitive();
+        let tensor = primitive
+            .tensor()
+            .tensor
+            .to_device((*adevice).into())
+            .to_kind(tch::Kind::Float);
+        let latent_pred = Tensor::from_primitive(TensorPrimitive::Float(
+            burn::backend::libtorch::TchTensor::new(tensor),
+        ));
+
+        let t_decode_start = Instant::now();
+        println!("Device check: latent_pred={:?}", latent_pred.device());
+        println!("Device check: audio_vae={:?}", audio_vae.device());
+        let decode_audio = audio_vae.decode(latent_pred).squeeze_dim::<2>(0);
+        let t_decode = t_decode_start.elapsed();
+        println!(
+            "Timing: latent_gen={:.3}s decode={:.3}s",
+            t_latent.as_secs_f64(),
+            t_decode.as_secs_f64()
+        );
+        decode_audio.slice([s![..], s![640..-640]]).squeeze()
+    }
+
+    pub fn generate_libtorch_with_prompt_features(
+        &mut self,
+        target_text: &str,
+        prompt_features: Option<&PromptFeatures<backend::LibTorch<f16>>>,
+        tokenizer_path: &Path,
+        min_len: Option<usize>,
+        max_len: Option<usize>,
+        inference_timesteps: Option<usize>,
+        cfg_value: Option<f32>,
+        retry_badcase: bool,
+        retry_badcase_max_times: usize,
+        retry_badcase_ratio_threshold: f32,
+        _debug: bool,
+        _stop_on_zero: bool,
+        audio_vae: &AudioVae<backend::LibTorch<f32>>,
+        device: &<backend::LibTorch<f16> as Backend>::Device,
+        adevice: &<backend::LibTorch<f32> as Backend>::Device,
+    ) -> Tensor<backend::LibTorch<f32>, 1> {
+        let t_start = Instant::now();
+        let latent_pred = self.generate_latent_with_prompt_features(
+            target_text,
+            prompt_features.cloned(),
             tokenizer_path,
             min_len,
             max_len,
