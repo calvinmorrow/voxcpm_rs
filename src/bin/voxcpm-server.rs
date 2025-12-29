@@ -35,6 +35,8 @@ use voxcpm_rs::voice_registry::{
 use voxcpm_rs::voxcpm::{PromptFeatures, VoxCPM, VoxCPMConfig};
 
 type BAud = backend::LibTorch<f32>;
+type BTtsBf16 = backend::LibTorch<bf16>;
+type BTtsF16 = backend::LibTorch<f16>;
 
 #[derive(Parser, Debug)]
 #[command(version, about, long_about = None)]
@@ -57,6 +59,8 @@ struct Args {
     max_concurrency: usize,
     #[arg(long, default_value_t = false)]
     warm_cache: bool,
+    #[arg(long, default_value_t = false)]
+    disable_chunking: bool,
 }
 
 #[derive(clap::ValueEnum, Clone, Copy, Debug)]
@@ -103,6 +107,7 @@ struct AppState {
     voices_dir: PathBuf,
     base_dir: PathBuf,
     inference_timesteps: Option<usize>,
+    disable_chunking: bool,
     semaphore: Arc<Semaphore>,
 }
 
@@ -171,6 +176,7 @@ async fn main() {
         voices_dir,
         base_dir,
         inference_timesteps: args.inference_timesteps,
+        disable_chunking: args.disable_chunking,
         semaphore: Arc::new(Semaphore::new(args.max_concurrency)),
     };
 
@@ -478,6 +484,11 @@ async fn handle_speech(
 
     let mut cache_insert: Option<PromptCacheEntry> = None;
     let mut model = state.model.lock().await;
+    let chunks = if state.disable_chunking {
+        vec![request.input.clone()]
+    } else {
+        split_sentences(&request.input)
+    };
     let (wav, sample_rate) = match &mut *model {
         ModelState::Bf16 { tts, audio_vae } => {
             let prompt_features = match &cached_entry {
@@ -498,23 +509,16 @@ async fn handle_speech(
                     features
                 }
             };
-            let wav = tts.generate_libtorch_with_prompt_features(
-                &request.input,
-                Some(&prompt_features),
+            let wav = generate_chunked_bf16(
+                tts,
+                &chunks,
+                &prompt_features,
                 &state.tokenizer_path,
-                None,
-                None,
                 state.inference_timesteps,
-                None,
-                false,
-                3,
-                6.0,
-                false,
-                false,
                 &*audio_vae,
                 &state.tts_device,
                 &state.audio_device,
-            );
+            )?;
             Ok((wav, audio_vae.sample_rate as u32))
         }
         ModelState::F16 { tts, audio_vae } => {
@@ -536,23 +540,16 @@ async fn handle_speech(
                     features
                 }
             };
-            let wav = tts.generate_libtorch_with_prompt_features(
-                &request.input,
-                Some(&prompt_features),
+            let wav = generate_chunked_f16(
+                tts,
+                &chunks,
+                &prompt_features,
                 &state.tokenizer_path,
-                None,
-                None,
                 state.inference_timesteps,
-                None,
-                false,
-                3,
-                6.0,
-                false,
-                false,
                 &*audio_vae,
                 &state.tts_device,
                 &state.audio_device,
-            );
+            )?;
             Ok((wav, audio_vae.sample_rate as u32))
         }
     }?;
@@ -563,11 +560,6 @@ async fn handle_speech(
             .await
             .insert(voice.voice_id.clone(), entry);
     }
-    let wav: Vec<f32> = wav
-        .cast(DType::F32)
-        .to_data()
-        .to_vec()
-        .map_err(|_| ApiError::server_error("failed to convert wav tensor"))?;
     let audio_len = if sample_rate == 0 {
         0.0
     } else {
@@ -600,6 +592,223 @@ async fn handle_speech(
         .headers_mut()
         .insert(header::CONTENT_TYPE, HeaderValue::from_static(content_type));
     Ok(response)
+}
+
+fn generate_chunked_bf16(
+    tts: &mut VoxCPM<BTtsBf16>,
+    chunks: &[String],
+    prompt_features: &PromptFeatures<BTtsBf16>,
+    tokenizer_path: &Path,
+    inference_timesteps: Option<usize>,
+    audio_vae: &AudioVae<BAud>,
+    tts_device: &LibTorchDevice,
+    audio_device: &<BAud as Backend>::Device,
+) -> Result<Vec<f32>, ApiError> {
+    let mut outputs: Vec<Vec<f32>> = Vec::with_capacity(chunks.len());
+    for chunk in chunks {
+        let chunk = chunk.trim();
+        if chunk.is_empty() {
+            continue;
+        }
+        let wav = tts.generate_libtorch_with_prompt_features(
+            chunk,
+            Some(prompt_features),
+            tokenizer_path,
+            None,
+            None,
+            inference_timesteps,
+            None,
+            false,
+            3,
+            6.0,
+            false,
+            false,
+            audio_vae,
+            tts_device,
+            audio_device,
+        );
+        let samples: Vec<f32> = wav
+            .cast(DType::F32)
+            .to_data()
+            .to_vec()
+            .map_err(|_| ApiError::server_error("failed to convert wav tensor"))?;
+        outputs.push(samples);
+    }
+    let sample_rate = audio_vae.sample_rate as u32;
+    Ok(crossfade_concat(outputs, sample_rate, 0.02))
+}
+
+fn generate_chunked_f16(
+    tts: &mut VoxCPM<BTtsF16>,
+    chunks: &[String],
+    prompt_features: &PromptFeatures<BTtsF16>,
+    tokenizer_path: &Path,
+    inference_timesteps: Option<usize>,
+    audio_vae: &AudioVae<BAud>,
+    tts_device: &LibTorchDevice,
+    audio_device: &<BAud as Backend>::Device,
+) -> Result<Vec<f32>, ApiError> {
+    let mut outputs: Vec<Vec<f32>> = Vec::with_capacity(chunks.len());
+    for chunk in chunks {
+        let chunk = chunk.trim();
+        if chunk.is_empty() {
+            continue;
+        }
+        let wav = tts.generate_libtorch_with_prompt_features(
+            chunk,
+            Some(prompt_features),
+            tokenizer_path,
+            None,
+            None,
+            inference_timesteps,
+            None,
+            false,
+            3,
+            6.0,
+            false,
+            false,
+            audio_vae,
+            tts_device,
+            audio_device,
+        );
+        let samples: Vec<f32> = wav
+            .cast(DType::F32)
+            .to_data()
+            .to_vec()
+            .map_err(|_| ApiError::server_error("failed to convert wav tensor"))?;
+        outputs.push(samples);
+    }
+    let sample_rate = audio_vae.sample_rate as u32;
+    Ok(crossfade_concat(outputs, sample_rate, 0.02))
+}
+
+fn split_sentences(text: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut current = String::new();
+    let mut chars = text.chars().peekable();
+    let mut prev: Option<char> = None;
+    while let Some(ch) = chars.next() {
+        current.push(ch);
+        let next = chars.peek().copied();
+        let is_ellipsis = ch == '.' && (prev == Some('.') || next == Some('.'));
+        let should_split = matches!(ch, '!' | '?' | '\n')
+            || (ch == '.' && !is_ellipsis && should_split_period(&current, prev, next));
+        if should_split {
+            let trimmed = current.trim();
+            if !trimmed.is_empty() {
+                out.push(trimmed.to_string());
+            }
+            current.clear();
+        }
+        prev = Some(ch);
+    }
+    let trimmed = current.trim();
+    if !trimmed.is_empty() {
+        out.push(trimmed.to_string());
+    }
+    out
+}
+
+fn should_split_period(current: &str, prev: Option<char>, next: Option<char>) -> bool {
+    if matches!(next, Some(n) if !n.is_whitespace()) {
+        return false;
+    }
+    if matches!(prev, Some(p) if p.is_ascii_digit())
+        && matches!(next, Some(n) if n.is_ascii_digit())
+    {
+        return false;
+    }
+
+    let trimmed = current.trim_end();
+    let base = trimmed.strip_suffix('.').unwrap_or(trimmed);
+    let last_word = extract_last_word(base);
+    if last_word.is_empty() {
+        return true;
+    }
+    let last_lower = last_word.to_ascii_lowercase();
+    if is_abbreviation(&last_lower) {
+        return false;
+    }
+    if last_word.len() == 1
+        && last_word.chars().next().unwrap().is_ascii_alphabetic()
+        && matches!(next, Some(c) if c.is_ascii_alphabetic())
+    {
+        return false;
+    }
+    true
+}
+
+fn extract_last_word(text: &str) -> String {
+    let mut out = String::new();
+    for ch in text.chars().rev() {
+        if ch.is_ascii_alphanumeric() {
+            out.push(ch);
+        } else if !out.is_empty() {
+            break;
+        }
+    }
+    out.chars().rev().collect()
+}
+
+fn is_abbreviation(word: &str) -> bool {
+    matches!(
+        word,
+        "mr" | "mrs"
+            | "ms"
+            | "dr"
+            | "prof"
+            | "sr"
+            | "jr"
+            | "st"
+            | "vs"
+            | "etc"
+            | "inc"
+            | "ltd"
+            | "co"
+            | "corp"
+            | "fig"
+            | "al"
+            | "gen"
+            | "rep"
+            | "sen"
+            | "gov"
+            | "lt"
+            | "col"
+            | "sgt"
+            | "adm"
+            | "capt"
+            | "cmdr"
+            | "mt"
+            | "ft"
+    )
+}
+
+fn crossfade_concat(chunks: Vec<Vec<f32>>, sample_rate: u32, seconds: f32) -> Vec<f32> {
+    let mut iter = chunks.into_iter();
+    let Some(mut acc) = iter.next() else {
+        return Vec::new();
+    };
+    let fade_len = ((sample_rate as f32) * seconds).round() as usize;
+    for mut next in iter {
+        if fade_len == 0 || acc.is_empty() || next.is_empty() {
+            acc.append(&mut next);
+            continue;
+        }
+        let n = fade_len.min(acc.len()).min(next.len());
+        if n == 0 {
+            acc.append(&mut next);
+            continue;
+        }
+        let acc_start = acc.len() - n;
+        for i in 0..n {
+            let a = acc[acc_start + i];
+            let b = next[i];
+            let t = i as f32 / n as f32;
+            acc[acc_start + i] = a * (1.0 - t) + b * t;
+        }
+        acc.extend_from_slice(&next[n..]);
+    }
+    acc
 }
 
 fn resolve_model_path(model_path: &str, tts_dtype: TtsDtype) -> PathBuf {
