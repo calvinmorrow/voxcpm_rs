@@ -666,8 +666,7 @@ impl VoxCPM<backend::LibTorch<bf16>> {
         ));
 
         let t_decode_start = Instant::now();
-        println!("Device check: latent_pred={:?}", latent_pred.device());
-        println!("Device check: audio_vae={:?}", audio_vae.device());
+        log_device_check_once(&latent_pred, audio_vae);
         let decode_audio = audio_vae.decode(latent_pred).squeeze_dim::<2>(0);
         let t_decode = t_decode_start.elapsed();
         println!(
@@ -728,8 +727,7 @@ impl VoxCPM<backend::LibTorch<bf16>> {
         ));
 
         let t_decode_start = Instant::now();
-        println!("Device check: latent_pred={:?}", latent_pred.device());
-        println!("Device check: audio_vae={:?}", audio_vae.device());
+        log_device_check_once(&latent_pred, audio_vae);
         let decode_audio = audio_vae.decode(latent_pred).squeeze_dim::<2>(0);
         let t_decode = t_decode_start.elapsed();
         println!(
@@ -792,8 +790,7 @@ impl VoxCPM<backend::LibTorch<f16>> {
         ));
 
         let t_decode_start = Instant::now();
-        println!("Device check: latent_pred={:?}", latent_pred.device());
-        println!("Device check: audio_vae={:?}", audio_vae.device());
+        log_device_check_once(&latent_pred, audio_vae);
         let decode_audio = audio_vae.decode(latent_pred).squeeze_dim::<2>(0);
         let t_decode = t_decode_start.elapsed();
         println!(
@@ -854,8 +851,7 @@ impl VoxCPM<backend::LibTorch<f16>> {
         ));
 
         let t_decode_start = Instant::now();
-        println!("Device check: latent_pred={:?}", latent_pred.device());
-        println!("Device check: audio_vae={:?}", audio_vae.device());
+        log_device_check_once(&latent_pred, audio_vae);
         let decode_audio = audio_vae.decode(latent_pred).squeeze_dim::<2>(0);
         let t_decode = t_decode_start.elapsed();
         println!(
@@ -881,6 +877,19 @@ fn layer_timing_mode() -> Option<&'static str> {
     static MODE: OnceLock<Option<String>> = OnceLock::new();
     MODE.get_or_init(|| std::env::var("VOXCPM_LAYER_TIMINGS").ok())
         .as_deref()
+}
+
+fn log_device_check_once(
+    latent_pred: &Tensor<backend::LibTorch<f32>, 3>,
+    audio_vae: &AudioVae<backend::LibTorch<f32>>,
+) {
+    static LOGGED: OnceLock<()> = OnceLock::new();
+    if LOGGED.get().is_some() {
+        return;
+    }
+    let _ = LOGGED.set(());
+    println!("Device check: latent_pred={:?}", latent_pred.device());
+    println!("Device check: audio_vae={:?}", audio_vae.device());
 }
 
 #[derive(Debug, Config)]

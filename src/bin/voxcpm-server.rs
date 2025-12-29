@@ -17,8 +17,10 @@ use burn::backend::{self};
 use burn::prelude::*;
 use burn::tensor::{DType, bf16, f16};
 use burn_store::{BurnpackStore, ModuleSnapshot};
+use bytes::Bytes;
 use clap::Parser;
 use tokio::sync::{Mutex, Semaphore};
+use tokio::time::{Instant as TokioInstant, sleep};
 
 use tch::Cuda;
 use voxcpm_rs::audio_utils::{
@@ -37,6 +39,36 @@ use voxcpm_rs::voxcpm::{PromptFeatures, VoxCPM, VoxCPMConfig};
 type BAud = backend::LibTorch<f32>;
 type BTtsBf16 = backend::LibTorch<bf16>;
 type BTtsF16 = backend::LibTorch<f16>;
+const STREAM_BLOCK_SAMPLES: usize = 4096;
+
+struct StreamPacer {
+    start: TokioInstant,
+    sent_samples: usize,
+    sample_rate: u32,
+}
+
+impl StreamPacer {
+    fn new(sample_rate: u32) -> Self {
+        Self {
+            start: TokioInstant::now(),
+            sent_samples: 0,
+            sample_rate,
+        }
+    }
+
+    async fn pace(&mut self, added_samples: usize) {
+        if self.sample_rate == 0 {
+            return;
+        }
+        self.sent_samples += added_samples;
+        let expected =
+            std::time::Duration::from_secs_f64(self.sent_samples as f64 / self.sample_rate as f64);
+        let elapsed = self.start.elapsed();
+        if expected > elapsed {
+            sleep(expected - elapsed).await;
+        }
+    }
+}
 
 #[derive(Parser, Debug)]
 #[command(version, about, long_about = None)]
@@ -467,9 +499,10 @@ async fn handle_speech(
         );
     }
 
-    let _permit = state
+    let permit = state
         .semaphore
-        .acquire()
+        .clone()
+        .acquire_owned()
         .await
         .map_err(|err| ApiError::server_error(format!("semaphore closed: {}", err)))?;
 
@@ -480,13 +513,28 @@ async fn handle_speech(
         cache.get(&voice.voice_id).cloned()
     };
 
-    let mut cache_insert: Option<PromptCacheEntry> = None;
-    let mut model = state.model.lock().await;
     let chunks = if state.disable_chunking {
         vec![request.input.clone()]
     } else {
         split_sentences(&request.input)
     };
+    if stream {
+        if response_format != "wav" {
+            return Err(
+                ApiError::bad_request("streaming requires wav").with_param("response_format")
+            );
+        }
+        return Ok(stream_wav_response(
+            state.clone(),
+            voice.clone(),
+            cached_entry,
+            chunks,
+            permit,
+        ));
+    }
+
+    let mut cache_insert: Option<PromptCacheEntry> = None;
+    let mut model = state.model.lock().await;
     let (wav, sample_rate) = match &mut *model {
         ModelState::Bf16 { tts, audio_vae } => {
             let prompt_features = match &cached_entry {
@@ -576,15 +624,6 @@ async fn handle_speech(
         audio_len,
         rtf
     );
-
-    if stream {
-        if response_format != "wav" {
-            return Err(
-                ApiError::bad_request("streaming requires wav").with_param("response_format")
-            );
-        }
-        return Ok(stream_wav_response(sample_rate, wav));
-    }
 
     let (content_type, body_bytes) = if response_format == "pcm" {
         ("audio/pcm", encode_pcm_i16(&wav))
@@ -818,14 +857,33 @@ fn crossfade_concat(chunks: Vec<Vec<f32>>, sample_rate: u32, seconds: f32) -> Ve
     acc
 }
 
-fn stream_wav_response(sample_rate: u32, samples: Vec<f32>) -> Response {
+fn stream_wav_response(
+    state: AppState,
+    voice: VoiceEntry,
+    cached_entry: Option<PromptCacheEntry>,
+    chunks: Vec<String>,
+    permit: tokio::sync::OwnedSemaphorePermit,
+) -> Response {
     use tokio::sync::mpsc;
-    let (tx, rx) = mpsc::channel::<Result<bytes::Bytes, std::io::Error>>(8);
-    let header = wav_header_unknown_length(sample_rate, 1, 16);
-    let pcm_bytes = encode_pcm_i16(&samples);
+    let (tx, rx) = mpsc::channel::<Result<Bytes, std::io::Error>>(8);
     tokio::spawn(async move {
-        let _ = tx.send(Ok(bytes::Bytes::from(header))).await;
-        let _ = tx.send(Ok(bytes::Bytes::from(pcm_bytes))).await;
+        let _permit = permit;
+        let sample_rate = {
+            let model = state.model.lock().await;
+            match &*model {
+                ModelState::Bf16 { audio_vae, .. } => audio_vae.sample_rate as u32,
+                ModelState::F16 { audio_vae, .. } => audio_vae.sample_rate as u32,
+            }
+        };
+        let header = wav_header_unknown_length(sample_rate, 1, 16);
+        if tx.send(Ok(Bytes::from(header))).await.is_err() {
+            return;
+        }
+        if let Err(err) =
+            stream_chunks_inner(state, voice, cached_entry, chunks, sample_rate, tx).await
+        {
+            eprintln!("streaming error: {:?}", err);
+        }
     });
     let body = Body::from_stream(tokio_stream::wrappers::ReceiverStream::new(rx));
     let mut response = Response::new(body);
@@ -833,6 +891,358 @@ fn stream_wav_response(sample_rate: u32, samples: Vec<f32>) -> Response {
         .headers_mut()
         .insert(header::CONTENT_TYPE, HeaderValue::from_static("audio/wav"));
     response
+}
+
+async fn stream_chunks_inner(
+    state: AppState,
+    voice: VoiceEntry,
+    cached_entry: Option<PromptCacheEntry>,
+    chunks: Vec<String>,
+    sample_rate: u32,
+    tx: tokio::sync::mpsc::Sender<Result<Bytes, std::io::Error>>,
+) -> Result<(), ApiError> {
+    let is_bf16 = {
+        let model = state.model.lock().await;
+        matches!(*model, ModelState::Bf16 { .. })
+    };
+    if is_bf16 {
+        stream_chunks_bf16(state, voice, cached_entry, chunks, sample_rate, tx).await
+    } else {
+        stream_chunks_f16(state, voice, cached_entry, chunks, sample_rate, tx).await
+    }
+}
+
+async fn stream_chunks_bf16(
+    state: AppState,
+    voice: VoiceEntry,
+    cached_entry: Option<PromptCacheEntry>,
+    chunks: Vec<String>,
+    sample_rate: u32,
+    tx: tokio::sync::mpsc::Sender<Result<Bytes, std::io::Error>>,
+) -> Result<(), ApiError> {
+    let voice_id = voice.voice_id.clone();
+    let prompt_features = match cached_entry {
+        Some(PromptCacheEntry::Bf16(features)) => {
+            println!("prompt_cache: hit voice_id={}", voice.voice_id);
+            features
+        }
+        _ => {
+            println!("prompt_cache: miss voice_id={}", voice.voice_id);
+            let prompt_tensor = load_prompt_tensor(&state, &voice)?;
+            let mut model = state.model.lock().await;
+            let ModelState::Bf16 { tts, audio_vae } = &mut *model else {
+                return Err(ApiError::server_error("model dtype changed"));
+            };
+            let features = tts.build_prompt_features(
+                voice.transcript.clone(),
+                prompt_tensor,
+                &*audio_vae,
+                &state.tts_device,
+            );
+            state.prompt_cache.lock().await.insert(
+                voice.voice_id.clone(),
+                PromptCacheEntry::Bf16(features.clone()),
+            );
+            features
+        }
+    };
+    stream_chunks_bf16_with_features(state, chunks, prompt_features, voice_id, sample_rate, tx)
+        .await
+}
+
+async fn stream_chunks_f16(
+    state: AppState,
+    voice: VoiceEntry,
+    cached_entry: Option<PromptCacheEntry>,
+    chunks: Vec<String>,
+    sample_rate: u32,
+    tx: tokio::sync::mpsc::Sender<Result<Bytes, std::io::Error>>,
+) -> Result<(), ApiError> {
+    let voice_id = voice.voice_id.clone();
+    let prompt_features = match cached_entry {
+        Some(PromptCacheEntry::F16(features)) => {
+            println!("prompt_cache: hit voice_id={}", voice.voice_id);
+            features
+        }
+        _ => {
+            println!("prompt_cache: miss voice_id={}", voice.voice_id);
+            let prompt_tensor = load_prompt_tensor(&state, &voice)?;
+            let mut model = state.model.lock().await;
+            let ModelState::F16 { tts, audio_vae } = &mut *model else {
+                return Err(ApiError::server_error("model dtype changed"));
+            };
+            let features = tts.build_prompt_features(
+                voice.transcript.clone(),
+                prompt_tensor,
+                &*audio_vae,
+                &state.tts_device,
+            );
+            state.prompt_cache.lock().await.insert(
+                voice.voice_id.clone(),
+                PromptCacheEntry::F16(features.clone()),
+            );
+            features
+        }
+    };
+    stream_chunks_f16_with_features(state, chunks, prompt_features, voice_id, sample_rate, tx).await
+}
+
+async fn stream_chunks_bf16_with_features(
+    state: AppState,
+    chunks: Vec<String>,
+    prompt_features: PromptFeatures<BTtsBf16>,
+    voice_id: String,
+    sample_rate: u32,
+    tx: tokio::sync::mpsc::Sender<Result<Bytes, std::io::Error>>,
+) -> Result<(), ApiError> {
+    let mut tail: Vec<f32> = Vec::new();
+    let overlap = overlap_samples(sample_rate);
+    let mut total_samples = 0usize;
+    let mut pacer = StreamPacer::new(sample_rate);
+    let start = Instant::now();
+    let mut gen_time = std::time::Duration::from_secs(0);
+    for chunk in chunks {
+        let chunk = chunk.trim();
+        if chunk.is_empty() {
+            continue;
+        }
+        let (samples, gen_elapsed) = {
+            let gen_start = Instant::now();
+            let mut model = state.model.lock().await;
+            let ModelState::Bf16 { tts, audio_vae } = &mut *model else {
+                return Err(ApiError::server_error("model dtype changed"));
+            };
+            let wav = tts.generate_libtorch_with_prompt_features(
+                chunk,
+                Some(&prompt_features),
+                &state.tokenizer_path,
+                None,
+                None,
+                state.inference_timesteps,
+                None,
+                false,
+                3,
+                6.0,
+                false,
+                false,
+                &*audio_vae,
+                &state.tts_device,
+                &state.audio_device,
+            );
+            let samples = wav
+                .cast(DType::F32)
+                .to_data()
+                .to_vec()
+                .map_err(|_| ApiError::server_error("failed to convert wav tensor"))?;
+            (samples, gen_start.elapsed())
+        };
+        gen_time += gen_elapsed;
+        send_overlap_stream(
+            &tx,
+            &mut tail,
+            samples,
+            overlap,
+            &mut total_samples,
+            &mut pacer,
+        )
+        .await;
+    }
+    if !tail.is_empty() {
+        send_pcm(&tx, &tail, &mut total_samples, &mut pacer).await;
+    }
+    log_stream_timing(
+        sample_rate,
+        total_samples,
+        start.elapsed(),
+        gen_time,
+        &voice_id,
+    );
+    Ok(())
+}
+
+async fn stream_chunks_f16_with_features(
+    state: AppState,
+    chunks: Vec<String>,
+    prompt_features: PromptFeatures<BTtsF16>,
+    voice_id: String,
+    sample_rate: u32,
+    tx: tokio::sync::mpsc::Sender<Result<Bytes, std::io::Error>>,
+) -> Result<(), ApiError> {
+    let mut tail: Vec<f32> = Vec::new();
+    let overlap = overlap_samples(sample_rate);
+    let mut total_samples = 0usize;
+    let mut pacer = StreamPacer::new(sample_rate);
+    let start = Instant::now();
+    let mut gen_time = std::time::Duration::from_secs(0);
+    for chunk in chunks {
+        let chunk = chunk.trim();
+        if chunk.is_empty() {
+            continue;
+        }
+        let (samples, gen_elapsed) = {
+            let gen_start = Instant::now();
+            let mut model = state.model.lock().await;
+            let ModelState::F16 { tts, audio_vae } = &mut *model else {
+                return Err(ApiError::server_error("model dtype changed"));
+            };
+            let wav = tts.generate_libtorch_with_prompt_features(
+                chunk,
+                Some(&prompt_features),
+                &state.tokenizer_path,
+                None,
+                None,
+                state.inference_timesteps,
+                None,
+                false,
+                3,
+                6.0,
+                false,
+                false,
+                &*audio_vae,
+                &state.tts_device,
+                &state.audio_device,
+            );
+            let samples = wav
+                .cast(DType::F32)
+                .to_data()
+                .to_vec()
+                .map_err(|_| ApiError::server_error("failed to convert wav tensor"))?;
+            (samples, gen_start.elapsed())
+        };
+        gen_time += gen_elapsed;
+        send_overlap_stream(
+            &tx,
+            &mut tail,
+            samples,
+            overlap,
+            &mut total_samples,
+            &mut pacer,
+        )
+        .await;
+    }
+    if !tail.is_empty() {
+        send_pcm(&tx, &tail, &mut total_samples, &mut pacer).await;
+    }
+    log_stream_timing(
+        sample_rate,
+        total_samples,
+        start.elapsed(),
+        gen_time,
+        &voice_id,
+    );
+    Ok(())
+}
+
+fn log_stream_timing(
+    sample_rate: u32,
+    samples: usize,
+    response_time: std::time::Duration,
+    gen_time: std::time::Duration,
+    voice: &str,
+) {
+    if sample_rate == 0 {
+        return;
+    }
+    let audio_len = samples as f64 / sample_rate as f64;
+    let response_rtf = if audio_len > 0.0 {
+        response_time.as_secs_f64() / audio_len
+    } else {
+        0.0
+    };
+    let gen_rtf = if audio_len > 0.0 {
+        gen_time.as_secs_f64() / audio_len
+    } else {
+        0.0
+    };
+    println!(
+        "request(stream): voice_id={} response_time={:.3}s audio_length={:.3}s response_rtf={:.3} gen_rtf={:.3}",
+        voice,
+        response_time.as_secs_f64(),
+        audio_len,
+        response_rtf,
+        gen_rtf
+    );
+}
+
+fn overlap_samples(sample_rate: u32) -> usize {
+    ((sample_rate as f32) * 0.02).round() as usize
+}
+
+async fn send_overlap_stream(
+    tx: &tokio::sync::mpsc::Sender<Result<Bytes, std::io::Error>>,
+    tail: &mut Vec<f32>,
+    mut samples: Vec<f32>,
+    overlap: usize,
+    total_samples: &mut usize,
+    pacer: &mut StreamPacer,
+) {
+    if overlap == 0 || samples.is_empty() {
+        send_pcm(tx, &samples, total_samples, pacer).await;
+        return;
+    }
+
+    if tail.is_empty() {
+        if samples.len() > overlap {
+            let split = samples.len() - overlap;
+            let new_tail = samples.split_off(split);
+            send_pcm(tx, &samples, total_samples, pacer).await;
+            *tail = new_tail;
+        } else {
+            send_pcm(tx, &samples, total_samples, pacer).await;
+        }
+        return;
+    }
+
+    let n = overlap.min(tail.len()).min(samples.len());
+    if n == 0 {
+        send_pcm(tx, &samples, total_samples, pacer).await;
+        tail.clear();
+        return;
+    }
+
+    let mut overlap_buf = Vec::with_capacity(n);
+    for i in 0..n {
+        let t = i as f32 / n as f32;
+        overlap_buf.push(tail[i] * (1.0 - t) + samples[i] * t);
+    }
+    send_pcm(tx, &overlap_buf, total_samples, pacer).await;
+
+    let start = n;
+    let mut end = samples.len();
+    if samples.len() > overlap {
+        end = samples.len() - overlap;
+    }
+    if end > start {
+        send_pcm(tx, &samples[start..end], total_samples, pacer).await;
+    }
+
+    if samples.len() > overlap {
+        *tail = samples[end..].to_vec();
+    } else {
+        tail.clear();
+    }
+}
+
+async fn send_pcm(
+    tx: &tokio::sync::mpsc::Sender<Result<Bytes, std::io::Error>>,
+    samples: &[f32],
+    total_samples: &mut usize,
+    pacer: &mut StreamPacer,
+) {
+    if samples.is_empty() {
+        return;
+    }
+    let mut offset = 0usize;
+    while offset < samples.len() {
+        let end = (offset + STREAM_BLOCK_SAMPLES).min(samples.len());
+        *total_samples += end - offset;
+        let bytes = encode_pcm_i16(&samples[offset..end]);
+        if tx.send(Ok(Bytes::from(bytes))).await.is_err() {
+            return;
+        }
+        pacer.pace(end - offset).await;
+        offset = end;
+    }
 }
 
 fn wav_header_unknown_length(sample_rate: u32, channels: u16, bits_per_sample: u16) -> Vec<u8> {

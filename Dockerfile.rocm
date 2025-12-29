@@ -9,10 +9,6 @@ RUN apt-get update && apt-get install --no-install-recommends -y \
     rustup default stable && \
     mkdir /app
 
-COPY Cargo.lock Cargo.toml /app/
-COPY src/ /app/src/
-COPY static/ /app/static/
-
 WORKDIR /app
 
 RUN git clone https://github.com/tracel-ai/burn && \
@@ -24,6 +20,10 @@ ENV AMDGPU_TARGETS=$AMDGPU_TARGETS \
     LIBTORCH_USE_PYTORCH=1 \
     LIBTORCH_BYPASS_VERSION_CHECK=1
     # Expects Torch 2.9.0
+
+COPY Cargo.lock Cargo.toml /app/
+COPY src/ /app/src/
+COPY static/ /app/static/
 
 RUN cargo build --release
 
