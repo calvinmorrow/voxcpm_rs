@@ -452,9 +452,7 @@ async fn handle_speech(
     State(state): State<AppState>,
     Json(request): Json<SpeechRequest>,
 ) -> Result<Response, ApiError> {
-    if request.stream.unwrap_or(false) {
-        return Err(ApiError::not_implemented("streaming is not implemented").with_param("stream"));
-    }
+    let stream = request.stream.unwrap_or(false);
     if request.input.trim().is_empty() {
         return Err(ApiError::bad_request("input is required").with_param("input"));
     }
@@ -578,6 +576,15 @@ async fn handle_speech(
         audio_len,
         rtf
     );
+
+    if stream {
+        if response_format != "wav" {
+            return Err(
+                ApiError::bad_request("streaming requires wav").with_param("response_format")
+            );
+        }
+        return Ok(stream_wav_response(sample_rate, wav));
+    }
 
     let (content_type, body_bytes) = if response_format == "pcm" {
         ("audio/pcm", encode_pcm_i16(&wav))
@@ -809,6 +816,42 @@ fn crossfade_concat(chunks: Vec<Vec<f32>>, sample_rate: u32, seconds: f32) -> Ve
         acc.extend_from_slice(&next[n..]);
     }
     acc
+}
+
+fn stream_wav_response(sample_rate: u32, samples: Vec<f32>) -> Response {
+    use tokio::sync::mpsc;
+    let (tx, rx) = mpsc::channel::<Result<bytes::Bytes, std::io::Error>>(8);
+    let header = wav_header_unknown_length(sample_rate, 1, 16);
+    let pcm_bytes = encode_pcm_i16(&samples);
+    tokio::spawn(async move {
+        let _ = tx.send(Ok(bytes::Bytes::from(header))).await;
+        let _ = tx.send(Ok(bytes::Bytes::from(pcm_bytes))).await;
+    });
+    let body = Body::from_stream(tokio_stream::wrappers::ReceiverStream::new(rx));
+    let mut response = Response::new(body);
+    response
+        .headers_mut()
+        .insert(header::CONTENT_TYPE, HeaderValue::from_static("audio/wav"));
+    response
+}
+
+fn wav_header_unknown_length(sample_rate: u32, channels: u16, bits_per_sample: u16) -> Vec<u8> {
+    let mut out = Vec::with_capacity(44);
+    out.extend_from_slice(b"RIFF");
+    out.extend_from_slice(&0xFFFF_FFFFu32.to_le_bytes());
+    out.extend_from_slice(b"WAVEfmt ");
+    out.extend_from_slice(&16u32.to_le_bytes());
+    out.extend_from_slice(&1u16.to_le_bytes());
+    out.extend_from_slice(&channels.to_le_bytes());
+    out.extend_from_slice(&sample_rate.to_le_bytes());
+    let byte_rate = sample_rate * u32::from(channels) * u32::from(bits_per_sample / 8);
+    out.extend_from_slice(&byte_rate.to_le_bytes());
+    let block_align = channels * (bits_per_sample / 8);
+    out.extend_from_slice(&block_align.to_le_bytes());
+    out.extend_from_slice(&bits_per_sample.to_le_bytes());
+    out.extend_from_slice(b"data");
+    out.extend_from_slice(&0xFFFF_FFFFu32.to_le_bytes());
+    out
 }
 
 fn resolve_model_path(model_path: &str, tts_dtype: TtsDtype) -> PathBuf {
