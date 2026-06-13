@@ -9,13 +9,34 @@ Migration plan: `docs/voxcpm2_migration_plan.md`
 
 ### Step 0.1: Install huggingface-hub Python Package
 
-- **Status**: In Progress
+- **Status**: Complete
 - **Started**: 2026-06-12 23:17 PDT
-- **Completed**: —
-- **Verification**: —
-- **Success Criteria Met**: —
-- **Git Commit**: —
+- **Completed**: 2026-06-12 23:18 PDT
+- **Verification**: `python -c "from huggingface_hub import hf_hub_download; print('OK')"` → OK; `hf --help` → available
+- **Success Criteria Met**: Yes — huggingface-hub==1.19.0 installed, hf CLI working
+- **Git Commit**: f5958bf
 - **Deviations**: —
+
+### Step 0.2: Download VoxCPM2 Weights
+
+- **Status**: Complete
+- **Started**: 2026-06-12 23:19 PDT
+- **Completed**: 2026-06-12 23:20 PDT
+- **Verification**: All 9 files downloaded to `/tmp/voxcpm2_weights`
+  - `model.safetensors`: 4.3GB (2B params bf16)
+  - `config.json`: architecture=voxcpm2, patch_size=4, hidden_size=2048, 28 layers, rope_scaling=longrope
+  - `tokenizer.json`: 3.6MB
+  - `audiovae.pth`: 360MB
+  - `audio_vae_config`: sample_rate=16000, out_sample_rate=48000, encoder_rates=[2,5,8,8], decoder_rates=[8,6,5,2,2,2]
+  - `dit_config`: hidden_dim=1024, cfm sigma_min=1e-6, solver=euler, inference_cfg_rate=2.0
+  - `residual_lm_no_rope`: true
+- **Success Criteria Met**: Yes — all key files exist, config confirms VoxCPM2 architecture with patch_size: 4
+- **Git Commit**: (pending)
+- **Deviations**: —
+
+### Step 0.3: Inspect VoxCPM2 Python Reference Code
+
+- **Status**: Pending
 
 ---
 
