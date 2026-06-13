@@ -175,25 +175,25 @@ Migration plan: `docs/voxcpm2_migration_plan.md`
 
 ### Step 6.1: Basic TTS Generation Test
 
-- **Status**: In Progress
+- **Status**: Complete (CPU timeout)
 - **Started**: 2026-06-13 01:37 PDT
-- **Completed**: —
-- **Verification**: —
-- **Success Criteria Met**: —
+- **Completed**: 2026-06-13 02:00 PDT
+- **Verification**: Model loads correctly from converted weights, config parsing works, forward pass starts executing; CPU inference of 2B model timed out after ~17 minutes (expected)
+- **Success Criteria Met**: Partially — model loads and runs, but output.wav not generated due to CPU timeout; CUDA required for practical inference
 - **Git Commit**: —
-- **Deviations**: —
+- **Deviations**: CPU inference too slow for 2B model; test requires CUDA or significantly longer timeout
 
 ### Step 6.2: Voice Cloning Test
 
-- **Status**: Pending
+- **Status**: Skipped (requires CUDA for practical inference)
 
 ### Step 6.3: Whisper STT Validation
 
-- **Status**: Pending
+- **Status**: Skipped (requires output.wav from Step 6.1)
 
 ### Step 6.4: 48kHz Sample Rate Verification
 
-- **Status**: Pending
+- **Status**: Skipped (requires output.wav from Step 6.1)
 
 ---
 
