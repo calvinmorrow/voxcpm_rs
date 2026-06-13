@@ -91,6 +91,7 @@ impl MiniCPMConfig {
                         self.max_position_embeddings,
                         self.rope_scaling.original_max_position_embeddings,
                     )
+                    .with_kv_channels(self.kv_channels)
                     .init(device),
                 )
             },
