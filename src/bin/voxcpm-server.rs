@@ -24,7 +24,7 @@ use tokio::time::{Instant as TokioInstant, sleep};
 
 use tch::Cuda;
 use voxcpm_rs::audio_utils::{
-    decode_wav_bytes, decode_wav_file, encode_pcm_i16, encode_wav_i16, resample_mono_to_44100,
+    decode_wav_bytes, decode_wav_file, encode_pcm_i16, encode_wav_i16, resample_mono_to_48000,
 };
 use voxcpm_rs::audiovae::AudioVae;
 use voxcpm_rs::openai_error::ApiError;
@@ -437,7 +437,7 @@ async fn handle_upload_voice(
 
     let wav = decode_wav_bytes(&wav_bytes)
         .map_err(|err| ApiError::bad_request(format!("wav decode failed: {}", err)))?;
-    let samples = resample_mono_to_44100(&wav.samples, wav.sample_rate)
+    let samples = resample_mono_to_48000(&wav.samples, wav.sample_rate)
         .map_err(|err| ApiError::server_error(format!("resample failed: {}", err)))?;
 
     let mut registry = state.registry.lock().await;
@@ -447,7 +447,7 @@ async fn handle_upload_voice(
         .await
         .map_err(|err| ApiError::server_error(format!("create voices dir: {}", err)))?;
     let wav_path = state.voices_dir.join(wav_filename);
-    let wav_bytes = encode_wav_i16(&samples, 44_100)
+    let wav_bytes = encode_wav_i16(&samples, 48_000)
         .map_err(|err| ApiError::server_error(format!("wav encode failed: {}", err)))?;
     tokio::fs::write(&wav_path, wav_bytes)
         .await
@@ -461,7 +461,7 @@ async fn handle_upload_voice(
         label,
         wav_path: rel_path,
         transcript,
-        sample_rate: 44_100,
+        sample_rate: 48_000,
         created_at,
     };
     registry.add_voice(entry.clone());
@@ -475,7 +475,7 @@ fn load_prompt_tensor(state: &AppState, voice: &VoiceEntry) -> Result<Tensor<BAu
     let wav_path = resolve_path(&state.base_dir, &voice.wav_path);
     let prompt_audio = decode_wav_file(&wav_path)
         .map_err(|err| ApiError::server_error(format!("prompt wav read failed: {}", err)))?;
-    let prompt_samples = resample_mono_to_44100(&prompt_audio.samples, prompt_audio.sample_rate)
+    let prompt_samples = resample_mono_to_48000(&prompt_audio.samples, prompt_audio.sample_rate)
         .map_err(|err| ApiError::server_error(format!("prompt resample failed: {}", err)))?;
     Ok(Tensor::<BAud, 1>::from_floats(&prompt_samples[..], &state.audio_device).unsqueeze())
 }

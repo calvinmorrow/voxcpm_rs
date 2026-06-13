@@ -55,7 +55,15 @@ pub fn decode_wav_mono_f32<R: Read + Seek>(reader: R) -> Result<WavData, String>
 }
 
 pub fn resample_mono_to_44100(input: &[f32], input_rate: u32) -> Result<Vec<f32>, String> {
-    if input_rate == 44_100 {
+    resample_mono(input, input_rate, 44_100)
+}
+
+pub fn resample_mono_to_48000(input: &[f32], input_rate: u32) -> Result<Vec<f32>, String> {
+    resample_mono(input, input_rate, 48_000)
+}
+
+fn resample_mono(input: &[f32], input_rate: u32, target_rate: u32) -> Result<Vec<f32>, String> {
+    if input_rate == target_rate {
         return Ok(input.to_vec());
     }
     if input_rate == 0 {
@@ -64,7 +72,7 @@ pub fn resample_mono_to_44100(input: &[f32], input_rate: u32) -> Result<Vec<f32>
     if input.is_empty() {
         return Ok(Vec::new());
     }
-    let ratio = 44_100f64 / input_rate as f64;
+    let ratio = target_rate as f64 / input_rate as f64;
     let out_len = ((input.len() as f64) * ratio).ceil() as usize;
     let mut output = Vec::with_capacity(out_len);
     for i in 0..out_len {
