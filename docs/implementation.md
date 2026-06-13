@@ -122,12 +122,12 @@ Migration plan: `docs/voxcpm2_migration_plan.md`
 
 ### Step 4.3: Update Forward Pass for VoxCPM2
 
-- **Status**: In Progress
+- **Status**: Complete
 - **Started**: 2026-06-13 00:44 PDT
-- **Completed**: —
-- **Verification**: —
-- **Success Criteria Met**: —
-- **Git Commit**: —
+- **Completed**: 2026-06-13 00:52 PDT
+- **Verification**: `cargo build --release` succeeds; VoxCPMLocDiTV2Config used at line 99, UnifiedCFM estimator is VoxCPMLocDiTV2<B>, forward pass uses V2 signature
+- **Success Criteria Met**: Yes — LocDiT V2 integrated, forward pass compiles, tensor shapes match upstream
+- **Git Commit**: 57cd988
 - **Deviations**: —
 
 ---
@@ -136,7 +136,13 @@ Migration plan: `docs/voxcpm2_migration_plan.md`
 
 ### Step 5.1: Update voxcpm-convert.rs for VoxCPM2
 
-- **Status**: Pending
+- **Status**: In Progress
+- **Started**: 2026-06-13 00:52 PDT
+- **Completed**: —
+- **Verification**: —
+- **Success Criteria Met**: —
+- **Git Commit**: —
+- **Deviations**: —
 
 ### Step 5.2: Verify Converted Weights
 
