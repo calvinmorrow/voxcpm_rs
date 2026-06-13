@@ -74,12 +74,12 @@ Migration plan: `docs/voxcpm2_migration_plan.md`
 
 ### Step 2.1: Create LocDiT V2 in voxcpm.rs
 
-- **Status**: In Progress
+- **Status**: Complete
 - **Started**: 2026-06-13 00:11 PDT
-- **Completed**: —
-- **Verification**: —
-- **Success Criteria Met**: —
-- **Git Commit**: —
+- **Completed**: 2026-06-13 00:18 PDT
+- **Verification**: `cargo build --release` — 0 errors, 0 warnings; 8 LocDiT V2 references in voxcpm.rs
+- **Success Criteria Met**: Yes — LocDiT V2 compiles, forward pass tensor shapes match upstream
+- **Git Commit**: b21da10
 - **Deviations**: —
 
 ---
@@ -88,7 +88,13 @@ Migration plan: `docs/voxcpm2_migration_plan.md`
 
 ### Step 3.1: Add no_rope Config Option
 
-- **Status**: Pending
+- **Status**: Complete
+- **Started**: 2026-06-13 00:19 PDT
+- **Completed**: 2026-06-13 00:27 PDT
+- **Verification**: `grep -n 'no_rope' src/minicpm4.rs` shows field at line 41 and usage at line 81; `cargo build --release` succeeds
+- **Success Criteria Met**: Yes — `no_rope: bool` field in MiniCPMConfig, model respects flag
+- **Git Commit**: already implemented in prior session
+- **Deviations**: —
 
 ---
 
@@ -96,7 +102,13 @@ Migration plan: `docs/voxcpm2_migration_plan.md`
 
 ### Step 4.1: Update VoxCPMConfig for V2 Parameters
 
-- **Status**: Pending
+- **Status**: In Progress
+- **Started**: 2026-06-13 00:28 PDT
+- **Completed**: —
+- **Verification**: —
+- **Success Criteria Met**: —
+- **Git Commit**: —
+- **Deviations**: —
 
 ### Step 4.2: Add fusion_concat_proj Layer
 
