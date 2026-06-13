@@ -37,6 +37,8 @@ pub struct MiniCPMConfig {
     pub dim_model_base: usize,
     pub scale_depth: f32,
     pub rope_theta: f32,
+    #[config(default = false)]
+    pub no_rope: bool,
     pub kv_channels: Option<usize>,
 }
 
@@ -46,6 +48,9 @@ impl MiniCPMConfig {
         kv_cache_config: Option<(usize, usize)>,
         device: &B::Device,
     ) -> MiniCPMModel<B> {
+        let head_dim = self
+            .kv_channels
+            .unwrap_or(self.hidden_size / self.num_attention_heads);
         MiniCPMModel {
             embed_tokens: if self.vocab_size > 0 {
                 Some(nn::EmbeddingConfig::new(self.vocab_size, self.hidden_size).init(device))
@@ -73,16 +78,23 @@ impl MiniCPMConfig {
             norm: MiniCPMRMSNorm {
                 inner: RmsNormConfig::new(self.hidden_size).init(device),
             },
-            rope_emb: MiniCPMLongRoPEconfig::new(
-                self.hidden_size,
-                self.num_attention_heads,
-                self.rope_theta,
-                self.rope_scaling.short_factor.clone(),
-                self.rope_scaling.long_factor.clone(),
-                self.max_position_embeddings,
-                self.rope_scaling.original_max_position_embeddings,
-            )
-            .init(device),
+            rope_emb: if self.no_rope {
+                None
+            } else {
+                Some(
+                    MiniCPMLongRoPEconfig::new(
+                        self.hidden_size,
+                        self.num_attention_heads,
+                        self.rope_theta,
+                        self.rope_scaling.short_factor.clone(),
+                        self.rope_scaling.long_factor.clone(),
+                        self.max_position_embeddings,
+                        self.rope_scaling.original_max_position_embeddings,
+                    )
+                    .init(device),
+                )
+            },
+            head_dim,
             kv_cache: kv_cache_config.map(|(batch_size, max_length)| {
                 StaticKVCache::new(
                     self.num_hidden_layers,
@@ -103,7 +115,8 @@ pub struct MiniCPMModel<B: Backend> {
     pub embed_tokens: Option<Embedding<B>>,
     pub layers: Vec<MiniCPMDecoderLayer<B>>,
     pub norm: MiniCPMRMSNorm<B>,
-    rope_emb: MiniCPMLongRoPE<B>,
+    rope_emb: Option<MiniCPMLongRoPE<B>>,
+    head_dim: usize,
     pub kv_cache: Option<StaticKVCache<B>>,
 }
 
@@ -124,7 +137,14 @@ impl<B: Backend> MiniCPMModel<B> {
         let start_rope = enable_timings.then(Instant::now);
         let position_ids =
             Tensor::arange(0..inputs_embeds.dims()[1] as i64, &inputs_embeds.device());
-        let position_emb = self.rope_emb.forward(position_ids.clone().unsqueeze());
+        let seq_len = inputs_embeds.dims()[1];
+        let position_emb = match &self.rope_emb {
+            Some(rope) => rope.forward(position_ids.clone().unsqueeze()),
+            None => (
+                Tensor::ones([seq_len, self.head_dim], &inputs_embeds.device()),
+                Tensor::zeros([seq_len, self.head_dim], &inputs_embeds.device()),
+            ),
+        };
         let rope_time = start_rope.map(|t| t.elapsed());
         let mut hidden_states = inputs_embeds;
 
@@ -174,9 +194,13 @@ impl<B: Backend> MiniCPMModel<B> {
     ) -> Tensor<B, 2> {
         //vdbg!(&inputs_embeds);
 
-        let position_emb = self
-            .rope_emb
-            .forward(Tensor::from_data([position_id], &inputs_embeds.device()));
+        let position_emb = match &self.rope_emb {
+            Some(rope) => rope.forward(Tensor::from_data([position_id], &inputs_embeds.device())),
+            None => (
+                Tensor::ones([1, self.head_dim], &inputs_embeds.device()),
+                Tensor::zeros([1, self.head_dim], &inputs_embeds.device()),
+            ),
+        };
         let mut hidden_states = inputs_embeds;
 
         for (i, decoder_layer) in self.layers.iter().enumerate() {

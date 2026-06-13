@@ -38,21 +38,27 @@ pub fn display_tensor_int<const D: usize, B: Backend>(t: &Tensor<B, D>) -> Strin
 #[derive(Debug, Config)]
 pub struct VoxCPMConfig {
     pub lm_config: MiniCPMConfig,
-    #[config(default = 2)]
+    #[config(default = 4)]
     pub patch_size: usize,
     #[config(default = 64)]
     pub feat_dim: usize,
-    #[config(default = 6)]
+    #[config(default = 8)]
     pub residual_lm_num_layers: usize,
-    #[config(default = 256)]
+    #[config(default = 512)]
     pub scalar_quantization_latent_dim: usize,
     #[config(default = 9)]
     pub scalar_quantization_scale: usize,
     pub encoder_config: VoxCPMLocEncConfig,
     pub dit_config: VoxCPMDitConfig,
     pub audio_vae_config: AudioVaeConfig,
-    #[config(default = 4096)]
+    #[config(default = 8192)]
     pub max_length: usize,
+    #[config(default = false)]
+    pub residual_lm_no_rope: bool,
+    #[config(default = 103)]
+    pub ref_audio_start_token: usize,
+    #[config(default = 104)]
+    pub ref_audio_end_token: usize,
 }
 
 impl VoxCPMConfig {
@@ -60,6 +66,7 @@ impl VoxCPMConfig {
         let mut residual_lm_config = self.lm_config.clone();
         residual_lm_config.num_hidden_layers = self.residual_lm_num_layers;
         residual_lm_config.vocab_size = 0;
+        residual_lm_config.no_rope = self.residual_lm_no_rope;
 
         let mut feat_encoder_lm_config = self.lm_config.clone();
         feat_encoder_lm_config.hidden_size = self.encoder_config.hidden_dim;
@@ -972,6 +979,8 @@ pub struct VoxCPMDitConfig {
     #[config(default = 4)]
     num_layers: usize,
     kv_channels: Option<usize>,
+    #[config(default = false)]
+    pub dit_mean_mode: bool,
     pub cfm_config: UnifiedCFMConfig,
 }
 
