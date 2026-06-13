@@ -30,7 +30,7 @@
 - PRs should describe the change, list commands used to validate, and note any required model files or sample inputs.
 
 ## Local Dependency Notes
-- The project expects a local Burn checkout (see `README.md`) and uses path dependencies in `Cargo.toml`.
+- The project uses burn v0.21.0 and burn-store v0.21.0 from crates.io (see `Cargo.toml`).
 
 ---
 

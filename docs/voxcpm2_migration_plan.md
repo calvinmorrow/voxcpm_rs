@@ -618,7 +618,7 @@ ffprobe -i output.wav 2>&1 | grep -E "Duration|Audio|sample"
 
 - `huggingface-hub` Python package for weight downloads
 - `hf` CLI utility
-- Burn framework (local checkout)
+- Burn framework (crates.io v0.21.0)
 - LibTorch CUDA backend
 - Agent Zero Whisper STT tool for validation
 

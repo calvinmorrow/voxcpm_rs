@@ -10,16 +10,12 @@ This is rust (using [burn](https://github.com/tracel-ai/burn)) implementation of
 
 # How to use
 
-Build `voxcpm-rs`. You have to use the development version of burn-rs.
+Build `voxcpm-rs` with `cargo build --release`.
 
 ```bash
-git clone https://github.com/tracel-ai/burn
-cd burn
-git checkout e0847cbf618395775bf534cbece9f0c7f0d897be
-cd ..
-git clone https://github.com/madushan1000/voxcpm_rs
+git clone https://github.com/calvinmorrow/voxcpm_rs
 cd voxcpm_rs
-cargo build --release
+cargo build --release --features convert
 cd ..
 ```
 Download the VoxCPM1.5 weights (safetensors) and convert them. The converter expects
