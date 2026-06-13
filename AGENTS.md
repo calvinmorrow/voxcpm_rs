@@ -2,15 +2,18 @@
 
 ## Project Structure & Module Organization
 - `src/lib.rs` exposes library entry points; CLI lives in `src/bin/voxcpm.rs`.
-- Core model code sits in `src/voxcpm.rs`, `src/minicpm4.rs`, and `src/audiovae.rs`.
+- Core model code sits in `src/voxcpm.rs`, `src/minicpm4.rs`, `src/audiovae.rs` (V1), and `src/audio_vae_v2.rs` (V2).
 - `burn-models/` holds converted model weights used at runtime; `voices/` contains sample audio (e.g., `voices/en_US_joe.wav`).
 - `model/` is repository data for model assets; `target/` is build output.
+- Supports both VoxCPM 1.5 and VoxCPM 2 architectures (48kHz, patch_size=4, LocDiT V2, fusion_concat_proj).
 
 ## Build, Test, and Development Commands
 - `cargo build --release`: build the optimized binary.
-- `cargo run --release --bin voxcpm-convert -- --input-path ../VoxCPM-0.5B/ --output-path burn-models/`: convert HuggingFace weights to Burn format.
+- `cargo run --release --bin voxcpm-convert --features convert -- --input-path ../VoxCPM-0.5B/ --output-path burn-models/`: convert HuggingFace weights to Burn format.
+- `cargo run --release --bin voxcpm-convert --features convert -- --input-path /tmp/voxcpm2_weights --output-path burn-models-voxcpm2 --tts-dtype bf16`: convert VoxCPM2 weights.
 - `cargo run --release --bin voxcpm run --model-path burn-models/ --target-text '...'`: run TTS; writes `output.wav`.
 - `mpv output.wav`: play the generated audio.
+- Note: VoxCPM2 (2B params) requires CUDA for practical inference; CPU is extremely slow.
 
 ## Coding Style & Naming Conventions
 - Rust 2024 edition; keep files/modules in `snake_case` and types in `CamelCase`.
