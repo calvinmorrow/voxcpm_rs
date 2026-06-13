@@ -50,17 +50,23 @@ Migration plan: `docs/voxcpm2_migration_plan.md`
 
 ### Step 1.1: Create audio_vae_v2.rs Module
 
-- **Status**: In Progress
+- **Status**: Complete
 - **Started**: 2026-06-12 23:26 PDT
-- **Completed**: —
-- **Verification**: —
-- **Success Criteria Met**: —
-- **Git Commit**: —
+- **Completed**: 2026-06-12 23:39 PDT
+- **Verification**: `cargo build --release` — 0 errors, 0 warnings; 1239 lines; 28 key identifier matches
+- **Success Criteria Met**: Yes — module compiles, config matches upstream V2, sample_rate=48000
+- **Git Commit**: 1cc801d
 - **Deviations**: —
 
 ### Step 1.2: Add AudioVAE V2 to lib.rs
 
-- **Status**: Pending
+- **Status**: Complete
+- **Started**: 2026-06-12 23:39 PDT
+- **Completed**: 2026-06-13 00:11 PDT
+- **Verification**: `cargo build --release` — 0 errors, 0 warnings; lib.rs exports `pub mod audio_vae_v2`
+- **Success Criteria Met**: Yes — module accessible as `voxcpm_rs::audio_vae_v2`
+- **Git Commit**: deaf1c3
+- **Deviations**: —
 
 ---
 
@@ -68,7 +74,13 @@ Migration plan: `docs/voxcpm2_migration_plan.md`
 
 ### Step 2.1: Create LocDiT V2 in voxcpm.rs
 
-- **Status**: Pending
+- **Status**: In Progress
+- **Started**: 2026-06-13 00:11 PDT
+- **Completed**: —
+- **Verification**: —
+- **Success Criteria Met**: —
+- **Git Commit**: —
+- **Deviations**: —
 
 ---
 
