@@ -112,17 +112,23 @@ Migration plan: `docs/voxcpm2_migration_plan.md`
 
 ### Step 4.2: Add fusion_concat_proj Layer
 
-- **Status**: In Progress
+- **Status**: Complete
 - **Started**: 2026-06-13 00:37 PDT
+- **Completed**: 2026-06-13 00:44 PDT
+- **Verification**: `cargo build --release` succeeds; fusion_concat_proj: Linear<B> added to VoxCPM<B>, init with LinearConfig::new(hidden_size*2, hidden_size), forward pass uses cat(enc_outputs, feat_embed) through fusion_concat_proj
+- **Success Criteria Met**: Yes — layer added, forward pass uses fusion_concat_proj
+- **Git Commit**: b536b23
+- **Deviations**: —
+
+### Step 4.3: Update Forward Pass for VoxCPM2
+
+- **Status**: In Progress
+- **Started**: 2026-06-13 00:44 PDT
 - **Completed**: —
 - **Verification**: —
 - **Success Criteria Met**: —
 - **Git Commit**: —
 - **Deviations**: —
-
-### Step 4.3: Update Forward Pass for VoxCPM2
-
-- **Status**: Pending
 
 ---
 
