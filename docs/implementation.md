@@ -102,17 +102,23 @@ Migration plan: `docs/voxcpm2_migration_plan.md`
 
 ### Step 4.1: Update VoxCPMConfig for V2 Parameters
 
-- **Status**: In Progress
+- **Status**: Complete
 - **Started**: 2026-06-13 00:28 PDT
+- **Completed**: 2026-06-13 00:37 PDT
+- **Verification**: `cargo build --release` succeeds; grep confirms patch_size=4, residual_lm_num_layers=8, scalar_quantization_latent_dim=512, max_length=8192, residual_lm_no_rope, ref_audio tokens, dit_mean_mode
+- **Success Criteria Met**: Yes — all new config fields present, defaults match upstream
+- **Git Commit**: 1cc0995
+- **Deviations**: —
+
+### Step 4.2: Add fusion_concat_proj Layer
+
+- **Status**: In Progress
+- **Started**: 2026-06-13 00:37 PDT
 - **Completed**: —
 - **Verification**: —
 - **Success Criteria Met**: —
 - **Git Commit**: —
 - **Deviations**: —
-
-### Step 4.2: Add fusion_concat_proj Layer
-
-- **Status**: Pending
 
 ### Step 4.3: Update Forward Pass for VoxCPM2
 

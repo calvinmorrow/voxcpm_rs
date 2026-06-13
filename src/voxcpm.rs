@@ -128,6 +128,11 @@ impl VoxCPMConfig {
             stop_head: LinearConfig::new(self.lm_config.hidden_size, 2)
                 .with_bias(false)
                 .init(device),
+            fusion_concat_proj: LinearConfig::new(
+                self.lm_config.hidden_size * 2,
+                self.lm_config.hidden_size,
+            )
+            .init(device),
         }
     }
 }
@@ -152,6 +157,8 @@ pub struct VoxCPM<B: Backend> {
     pub stop_proj: Linear<B>,
     //pub stop_actn: Silu
     pub stop_head: Linear<B>,
+
+    pub fusion_concat_proj: Linear<B>,
 }
 
 #[derive(Debug, Clone)]
@@ -479,10 +486,15 @@ impl<B: Backend> VoxCPM<B> {
             .slice([s![..], s![-1], s![..]])
             .squeeze_dim::<2>(0); //Tensor<B, 2>
 
-        let (residual_enc_outputs, residual_kv_cache_tuple) = self.residual_lm.forward(
-            enc_outputs.unsqueeze() + feat_mask.unsqueeze_dims(&[-1]) * feat_embed,
-            true,
-        ); //(Tensor<B, 3>, (Tensor<B, 4>, Tensor<B, 4>))
+        let residual_inputs = self.fusion_concat_proj.forward(Tensor::cat(
+            vec![
+                enc_outputs.clone(),
+                feat_mask.unsqueeze_dims(&[-1]) * feat_embed.clone(),
+            ],
+            2,
+        )); //Tensor<B, 3>
+        let (residual_enc_outputs, residual_kv_cache_tuple) =
+            self.residual_lm.forward(residual_inputs.unsqueeze(), true); //Tensor<B, 3>, (Tensor<B, 4>, Tensor<B, 4>)
 
         if let Some(kv_cache) = self.residual_lm.kv_cache.as_mut() {
             kv_cache.fill_cache(residual_kv_cache_tuple)
