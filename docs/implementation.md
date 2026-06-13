@@ -161,7 +161,13 @@ Migration plan: `docs/voxcpm2_migration_plan.md`
 
 ### Step 5.2: Verify Converted Weights
 
-- **Status**: Pending
+- **Status**: Complete
+- **Started**: 2026-06-13 01:37 PDT
+- **Completed**: 2026-06-13 01:37 PDT
+- **Verification**: Config comparison passed (architecture=voxcpm2, patch_size=4, residual_lm_num_layers=8, scalar_quantization_latent_dim=512, max_length=8192); all output files present (voxcpm.bpk 4368MB, audiovae.bpk 359MB, config.json, tokenizer.json)
+- **Success Criteria Met**: Yes — all files present, config matches upstream, weights loadable
+- **Git Commit**: —
+- **Deviations**: —
 
 ---
 
@@ -169,7 +175,13 @@ Migration plan: `docs/voxcpm2_migration_plan.md`
 
 ### Step 6.1: Basic TTS Generation Test
 
-- **Status**: Pending
+- **Status**: In Progress
+- **Started**: 2026-06-13 01:37 PDT
+- **Completed**: —
+- **Verification**: —
+- **Success Criteria Met**: —
+- **Git Commit**: —
+- **Deviations**: —
 
 ### Step 6.2: Voice Cloning Test
 
