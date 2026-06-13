@@ -136,13 +136,28 @@ Migration plan: `docs/voxcpm2_migration_plan.md`
 
 ### Step 5.1: Update voxcpm-convert.rs for VoxCPM2
 
-- **Status**: In Progress
+- **Status**: Complete
 - **Started**: 2026-06-13 00:52 PDT
-- **Completed**: —
-- **Verification**: —
-- **Success Criteria Met**: —
-- **Git Commit**: —
+- **Completed**: 2026-06-13 01:26 PDT
+- **Verification**:
+  - `cargo run --release --bin voxcpm-convert --features convert -- --input-path /tmp/voxcpm2_weights --output-path /tmp/test-voxcpm2-convert --tts-dtype bf16`
+  - TTS: 577/577 tensors loaded successfully (0 missing, 0 unused, 0 errors)
+  - AudioVAE: 299 tensors loaded (13 unused V2-specific sr_cond_model tensors)
+  - Output files: voxcpm.bpk (4.3GB), audiovae.bpk (360MB), config.json, tokenizer.json
+  - `cargo build --release` — 0 errors, 0 warnings
+- **Success Criteria Met**: Yes — conversion completes without errors, all output .bpk files created
+- **Git Commit**: ae549c9
 - **Deviations**: —
+- **Changes**:
+  1. Added `preprocess_config()` to handle V2→V1 config compatibility:
+     - Injects missing `no_rope`, `kv_channels`, `rope_theta`, `dim_model_base`, `scale_depth` into lm_config
+     - Renames `mean_mode` → `dit_mean_mode` in dit_config
+     - Strips V2-only `inference_cfg_rate` from cfm_config
+     - Strips V2-only fields (sr_bin_boundaries, out_sample_rate, cond_type, cond_dim, cond_out_layer) from audio_vae_config
+     - Adds missing top-level `ref_audio_start_token`/`ref_audio_end_token`
+  2. Added `build_key_remappings()` generating all `*.norm.weight` → `*.norm.inner.gamma` remappings for base_lm (28 layers), residual_lm (8 layers), feat_encoder (12 layers), feat_decoder (12 layers) = 124 total remappings
+  3. Fixed `MiniCPMLongRoPEconfig` in minicpm4.rs to receive `kv_channels` via `.with_kv_channels()` — resolves head_dim mismatch for feat_encoder/feat_decoder (hidden_size/num_heads != kv_channels)
+  4. Updated converter to extract layer counts from preprocessed config and pass to remapping generator
 
 ### Step 5.2: Verify Converted Weights
 
