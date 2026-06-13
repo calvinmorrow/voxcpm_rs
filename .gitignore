@@ -1,5 +1,6 @@
 /target
 .vscode
+.a0proj
 .idea
 burn-models/
 model
