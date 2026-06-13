@@ -1,4 +1,5 @@
 pub mod audio_utils;
+pub mod audio_vae_v2;
 pub mod audiovae;
 pub mod minicpm4;
 pub mod openai_error;
