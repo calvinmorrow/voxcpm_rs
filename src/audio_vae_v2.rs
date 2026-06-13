@@ -60,18 +60,15 @@ impl AudioVaeConfigV2 {
             .init(device);
 
         let sr_bin_boundaries = self.sr_bin_boundaries.clone();
-        let decoder = CausalDecoderV2Config::new(
-            latent_dim,
-            self.decoder_dim,
-            self.decoder_rates.clone(),
-        )
-        .with_depthwise(depthwise)
-        .with_use_noise_block(use_noise_block)
-        .with_sr_bin_boundaries(sr_bin_boundaries)
-        .with_cond_type(self.cond_type.clone())
-        .with_cond_dim(self.cond_dim)
-        .with_cond_out_layer(self.cond_out_layer)
-        .init(device);
+        let decoder =
+            CausalDecoderV2Config::new(latent_dim, self.decoder_dim, self.decoder_rates.clone())
+                .with_depthwise(depthwise)
+                .with_use_noise_block(use_noise_block)
+                .with_sr_bin_boundaries(sr_bin_boundaries)
+                .with_cond_type(self.cond_type.clone())
+                .with_cond_dim(self.cond_dim)
+                .with_cond_out_layer(self.cond_out_layer)
+                .init(device);
 
         let hop_length: usize = self.encoder_rates.iter().product();
         let decode_chunk_size: usize = self.decoder_rates.iter().product();
@@ -154,7 +151,7 @@ impl CausalEncoderV2Config {
     pub fn init<B: Backend>(&self, device: &B::Device) -> CausalEncoderV2<B> {
         let mut block: Vec<CausalEncoderLayerV2<B>> = vec![CausalEncoderLayerV2::WNCausalConv1d(
             WNCausalConv1dV2Config::new(1, self.d_model, 7)
-                .with_padding(3)
+                .with_causal_padding(3)
                 .init(device),
         )];
 
@@ -174,10 +171,10 @@ impl CausalEncoderV2Config {
         CausalEncoderV2 {
             block,
             fc_mu: WNCausalConv1dV2Config::new(d_model_n, self.latent_dim, 3)
-                .with_padding(1)
+                .with_causal_padding(1)
                 .init(device),
             fc_logvar: WNCausalConv1dV2Config::new(d_model_n, self.latent_dim, 3)
-                .with_padding(1)
+                .with_causal_padding(1)
                 .init(device),
         }
     }
@@ -253,7 +250,6 @@ pub struct CausalDecoderV2Config {
 impl CausalDecoderV2Config {
     pub fn init<B: Backend>(&self, device: &B::Device) -> CausalDecoderV2<B> {
         let has_sr_cond = self.sr_bin_boundaries.is_some();
-        let sr_bin_boundaries = self.sr_bin_boundaries.clone();
 
         if has_sr_cond {
             self.init_with_sr_cond(device)
@@ -263,7 +259,7 @@ impl CausalDecoderV2Config {
     }
 
     fn init_sequential<B: Backend>(&self, device: &B::Device) -> CausalDecoderV2<B> {
-        let mut model = self.build_layers(device);
+        let model = self.build_layers(device);
         CausalDecoderV2 {
             model,
             sr_bin_boundaries: None,
@@ -306,12 +302,15 @@ impl CausalDecoderV2Config {
         }
     }
 
-    fn build_init_layers<B: Backend>(&self, device: &B::Device) -> Vec<CausalDecoderPlainLayerV2<B>> {
+    fn build_init_layers<B: Backend>(
+        &self,
+        device: &B::Device,
+    ) -> Vec<CausalDecoderPlainLayerV2<B>> {
         if self.depthwise {
             vec![
                 CausalDecoderPlainLayerV2::WNCausalConv1d(
                     WNCausalConv1dV2Config::new(self.input_channel, self.input_channel, 7)
-                        .with_padding(3)
+                        .with_causal_padding(3)
                         .with_groups(self.input_channel)
                         .init(device),
                 ),
@@ -322,7 +321,7 @@ impl CausalDecoderV2Config {
         } else {
             vec![CausalDecoderPlainLayerV2::WNCausalConv1d(
                 WNCausalConv1dV2Config::new(self.input_channel, self.channels, 7)
-                    .with_padding(3)
+                    .with_causal_padding(3)
                     .init(device),
             )]
         }
@@ -362,13 +361,16 @@ impl CausalDecoderV2Config {
         result
     }
 
-    fn build_final_layers<B: Backend>(&self, device: &B::Device) -> Vec<CausalDecoderPlainLayerV2<B>> {
+    fn build_final_layers<B: Backend>(
+        &self,
+        device: &B::Device,
+    ) -> Vec<CausalDecoderPlainLayerV2<B>> {
         let output_dim = self.channels / 2usize.pow(self.rates.len() as u32);
         vec![
             CausalDecoderPlainLayerV2::Snake1d(Snake1dV2Config::new(output_dim).init(device)),
             CausalDecoderPlainLayerV2::WNCausalConv1d(
                 WNCausalConv1dV2Config::new(output_dim, self.d_out, 7)
-                    .with_padding(3)
+                    .with_causal_padding(3)
                     .init(device),
             ),
             CausalDecoderPlainLayerV2::Tanh(Tanh::new()),
@@ -457,7 +459,7 @@ impl<B: Backend> CausalDecoderV2<B> {
     ) -> Tensor<B, 3> {
         if self.sr_bin_boundaries.is_some() {
             let sr_cond = sr_cond
-                .unwrap_or_else(|| Tensor::from_float(default_out_sr as f64, &x.device()));
+                .unwrap_or_else(|| Tensor::ones(&vec![1], &x.device()) * (default_out_sr as f64));
             let sr_idx = self.bucketize_sr(sr_cond);
 
             for (layer, cond_layer) in self.model.iter().zip(self.sr_cond_layers.iter()) {
@@ -477,30 +479,28 @@ impl<B: Backend> CausalDecoderV2<B> {
     /// Bucketize sample rate values against sr_bin_boundaries.
     fn bucketize_sr(&self, sr: Tensor<B, 1>) -> Tensor<B, 1> {
         let boundaries = self.sr_bin_boundaries.as_ref().unwrap();
-        let buckets = (boundaries.len() + 1) as i64;
-        let bounds_tensor = Tensor::from_floats(
-            boundaries.iter().map(|&b| b as f64).collect::<Vec<_>>(),
-            &sr.device(),
-        );
-        let bounds_expanded = bounds_tensor.expand([sr.dims()[0], boundaries.len()]);
-        let sr_expanded = sr.expand([sr.dims()[0], boundaries.len()]);
+        let batch = sr.dims()[0];
+        let device = sr.device();
+        let buckets = (boundaries.len() + 1) as f64;
+        let bounds_vec: Vec<f32> = boundaries.iter().map(|&b| b as f32).collect();
+        let bounds_tensor: Tensor<B, 1> = Tensor::from_floats(bounds_vec.as_slice(), &device);
+        let bounds_expanded = bounds_tensor.expand([batch, boundaries.len()]);
+        let sr_expanded = sr.expand([batch, boundaries.len()]);
 
-        // Count how many boundaries each sr value exceeds
+        // Count how many boundaries each sr value exceeds: [B,N] -> [B]
         let count = sr_expanded
-            .greater_elem(bounds_expanded)
-            .to_float()
-            .sum_dim(1);
+            .greater(bounds_expanded)
+            .int()
+            .float()
+            .sum_dims(&[1])
+            .squeeze();
 
         // Clamp to valid bucket range [0, buckets-1]
-        let idx = count
-            .cmask(Tensor::greater(
-                &count,
-                Tensor::from_floats([buckets as f64], &sr.device()).expand([sr.dims()[0]]),
-            ))
-            .where_true_false(
-                Tensor::from_floats([buckets as f64], &sr.device()).expand([sr.dims()[0]]),
-                &count,
-            );
+        let max_val = Tensor::ones(&vec![batch], &device) * buckets;
+        let overflow = count.clone().greater(max_val.clone());
+        let overflow_f = overflow.float();
+        let idx =
+            overflow_f.clone() * max_val + (Tensor::ones_like(&overflow_f) - overflow_f) * count;
 
         idx
     }
@@ -528,19 +528,17 @@ impl CausalDecoderBlockV2Config {
     pub fn init<B: Backend>(&self, device: &B::Device) -> CausalDecoderBlockV2<B> {
         let causal_pad = self.stride / 2;
         let causal_out_pad = self.stride % 2;
+        let causal_trim = causal_pad * 2 - causal_out_pad;
 
         let mut block = vec![
-            CausalDecoderBlockLayerV2::Snake1d(
-                Snake1dV2Config::new(self.input_dim).init(device),
-            ),
+            CausalDecoderBlockLayerV2::Snake1d(Snake1dV2Config::new(self.input_dim).init(device)),
             CausalDecoderBlockLayerV2::WNCausalTransposeConv1d(
                 WNCausalTransposeConv1dV2Config::new(
                     self.input_dim,
                     self.output_dim,
                     2 * self.stride,
                     self.stride,
-                    causal_pad,
-                    causal_out_pad,
+                    causal_trim,
                 )
                 .init(device),
             ),
@@ -620,6 +618,7 @@ impl CausalEncoderBlockV2Config {
         let input_dim = self.input_dim.unwrap_or(self.output_dim / 2);
         let causal_pad = (self.stride as f64 / 2.0).ceil() as usize;
         let causal_out_pad = self.stride % 2;
+        let total_causal_padding = causal_pad * 2 - causal_out_pad;
 
         let block = vec![
             CausalEncoderBlockLayerV2::CausalResidualUnit(
@@ -647,8 +646,7 @@ impl CausalEncoderBlockV2Config {
             CausalEncoderBlockLayerV2::WNCausalConv1d(
                 WNCausalConv1dV2Config::new(input_dim, self.output_dim, 2 * self.stride)
                     .with_stride(self.stride)
-                    .with_causal_padding(causal_pad)
-                    .with_causal_output_padding(causal_out_pad)
+                    .with_causal_padding(total_causal_padding)
                     .init(device),
             ),
         ];
@@ -756,7 +754,11 @@ impl<B: Backend> CausalResidualUnitV2<B> {
         }
         // V2 asserts pad==0 (output length == input length for residual units)
         let pad = (x.dims()[2] - y.dims()[2]) / 2;
-        assert!(pad == 0, "CausalResidualUnitV2: output length mismatch, pad={}", pad);
+        assert!(
+            pad == 0,
+            "CausalResidualUnitV2: output length mismatch, pad={}",
+            pad
+        );
         x + y
     }
 }
@@ -931,7 +933,7 @@ pub struct Snake1dV2Config {
 impl Snake1dV2Config {
     pub fn init<B: Backend>(&self, device: &B::Device) -> Snake1dV2<B> {
         Snake1dV2 {
-            alpha: Param::from_tensor(Tensor::ones(&[1, self.channels, 1], device)),
+            alpha: Param::from_tensor(Tensor::ones(&vec![1, self.channels, 1], device)),
         }
     }
 }
@@ -1005,8 +1007,9 @@ pub struct SampleRateConditionLayerConfig {
 
 impl SampleRateConditionLayerConfig {
     pub fn init<B: Backend>(&self, device: &B::Device) -> SampleRateConditionLayer<B> {
-        let out_layer_in_dim = if self.cond_type == "concat" { self.input_dim + self.cond_dim }
-        else {
+        let out_layer_in_dim = if self.cond_type == "concat" {
+            self.input_dim + self.cond_dim
+        } else {
             self.input_dim
         };
 
@@ -1019,7 +1022,7 @@ impl SampleRateConditionLayerConfig {
                         device,
                     )
                 } else {
-                    Tensor::ones(&[self.sr_bin_buckets, self.input_dim], device)
+                    Tensor::ones(&vec![self.sr_bin_buckets, self.input_dim], device)
                 };
                 let bias_weight = if self.cond_type == "scale_bias_init" {
                     Tensor::random(
@@ -1028,7 +1031,7 @@ impl SampleRateConditionLayerConfig {
                         device,
                     )
                 } else {
-                    Tensor::zeros(&[self.sr_bin_buckets, self.input_dim], device)
+                    Tensor::zeros(&vec![self.sr_bin_buckets, self.input_dim], device)
                 };
 
                 let out = if self.out_layer {
@@ -1046,7 +1049,7 @@ impl SampleRateConditionLayerConfig {
                     scale_weight: Some(Param::from_tensor(scale_weight)),
                     bias_weight: Some(Param::from_tensor(bias_weight)),
                     cond_weight: None,
-                    out_layer,
+                    out_layer: self.out_layer,
                     out_conv: out,
                 }
             }
@@ -1115,16 +1118,20 @@ impl<B: Backend> SampleRateConditionLayer<B> {
         let indices = Tensor::arange(0..num_buckets as i64, &weight.device())
             .reshape([1, num_buckets])
             .expand([batch, num_buckets]);
-        let sr_flat = sr_idx.reshape([batch, 1]).expand([batch, num_buckets]);
-        let one_hot = indices.equal(&sr_flat).to_float();
+        let sr_flat = sr_idx
+            .clone()
+            .reshape([batch, 1])
+            .expand([batch, num_buckets]);
+        let sr_int = sr_flat.int();
+        let one_hot = indices.equal(sr_int).int().float();
 
         // [B, num_buckets] @ [num_buckets, dim] = [B, dim]
-        let selected = one_hot.matmul(weight);
+        let selected = one_hot.matmul(weight.clone());
         selected.reshape([batch, dim, 1])
     }
 
     pub fn forward(&self, x: Tensor<B, 3>, sr_idx: Tensor<B, 1>) -> Tensor<B, 3> {
-        let [batch, channels, time_steps] = x.dims();
+        let [batch, _channels, time_steps] = x.dims();
 
         let mut result = match self.cond_type.as_str() {
             "scale_bias" | "scale_bias_init" => {
@@ -1139,8 +1146,12 @@ impl<B: Backend> SampleRateConditionLayer<B> {
             "concat" => {
                 let cond = Self::embed_lookup(&self.cond_weight.as_ref().unwrap().val(), &sr_idx);
                 // Expand cond to [B, cond_dim, T]
-                let cond_expanded = cond.expand([batch, self.cond_weight.as_ref().unwrap().val().dims()[1], time_steps]);
-                burn::Tensor::cat([x, cond_expanded], 1)
+                let cond_expanded = cond.expand([
+                    batch,
+                    self.cond_weight.as_ref().unwrap().val().dims()[1],
+                    time_steps,
+                ]);
+                burn::Tensor::cat(vec![x, cond_expanded], 1)
             }
             _ => panic!("Unsupported cond_type: {}", self.cond_type),
         };
@@ -1149,9 +1160,10 @@ impl<B: Backend> SampleRateConditionLayer<B> {
             if let Some(conv) = &self.out_conv {
                 // Snake1d + WNConv1d(1x1)
                 // Inline snake activation
-                let alpha = Tensor::ones(&[1, result.dims()[1], 1], &result.device());
+                let alpha = Tensor::ones(&vec![1, result.dims()[1], 1], &result.device());
                 result = result.clone()
-                    + (alpha.clone() + 1e-9).recip() * (alpha * result.clone()).sin().powi_scalar(2);
+                    + (alpha.clone() + 1e-9).recip()
+                        * (alpha * result.clone()).sin().powi_scalar(2);
                 result = conv.forward(result);
             }
         }
@@ -1192,11 +1204,7 @@ mod tests {
         assert_eq!(vae.decode_chunk_size, 1920); // 8*6*5*2*2*2
 
         // Encode a short audio clip: [1, 1, 640]
-        let audio = Tensor::random(
-            [1, 1, 640],
-            Distribution::Normal(0.0, 1.0),
-            &device,
-        );
+        let audio = Tensor::random([1, 1, 640], Distribution::Normal(0.0, 1.0), &device);
         let latent = vae.encode(audio, None);
         assert_eq!(latent.dims()[0], 1);
         assert_eq!(latent.dims()[1], 64);
@@ -1209,11 +1217,7 @@ mod tests {
         let vae = config.init::<B>(&device);
 
         // Decode a latent: [1, 64, 10]
-        let latent = Tensor::random(
-            [1, 64, 10],
-            Distribution::Normal(0.0, 1.0),
-            &device,
-        );
+        let latent = Tensor::random([1, 64, 10], Distribution::Normal(0.0, 1.0), &device);
         let audio = vae.decode(latent, None);
         assert_eq!(audio.dims()[0], 1);
         assert_eq!(audio.dims()[1], 1);
@@ -1225,11 +1229,7 @@ mod tests {
         let config = AudioVaeConfigV2::new();
         let vae = config.init::<B>(&device);
 
-        let audio = Tensor::random(
-            [1, 1, 1280],
-            Distribution::Normal(0.0, 1.0),
-            &device,
-        );
+        let audio = Tensor::random([1, 1, 1280], Distribution::Normal(0.0, 1.0), &device);
         let latent = vae.encode(audio.clone(), None);
         let decoded = vae.decode(latent, None);
 
