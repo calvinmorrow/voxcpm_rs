@@ -4,8 +4,8 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
-burn = { path = "burn/crates/burn", features = ["tch", "fusion"] }
-burn-store = { path = "burn/crates/burn-store", default-features = false, features = ["std", "burnpack", "memmap"] }
+burn = { version = "0.21.0", features = ["tch", "fusion"] }
+burn-store = { version = "0.21.0", default-features = false, features = ["std", "burnpack", "memmap"] }
 hound = "3.5.1"
 tokenizers = "0.22.1"
 kdam = "0.6.3"

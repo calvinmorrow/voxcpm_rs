@@ -15,6 +15,7 @@ use axum::{Json, Router};
 use burn::backend::libtorch::LibTorchDevice;
 use burn::backend::{self};
 use burn::prelude::*;
+use burn::tensor::backend::BackendTypes;
 use burn::tensor::{DType, bf16, f16};
 use burn_store::{BurnpackStore, ModuleSnapshot};
 use bytes::Bytes;
@@ -648,7 +649,7 @@ fn generate_chunked_bf16(
     inference_timesteps: Option<usize>,
     audio_vae: &AudioVae<BAud>,
     tts_device: &LibTorchDevice,
-    audio_device: &<BAud as Backend>::Device,
+    audio_device: &<BAud as BackendTypes>::Device,
 ) -> Result<Vec<f32>, ApiError> {
     let mut outputs: Vec<Vec<f32>> = Vec::with_capacity(chunks.len());
     for chunk in chunks {
@@ -692,7 +693,7 @@ fn generate_chunked_f16(
     inference_timesteps: Option<usize>,
     audio_vae: &AudioVae<BAud>,
     tts_device: &LibTorchDevice,
-    audio_device: &<BAud as Backend>::Device,
+    audio_device: &<BAud as BackendTypes>::Device,
 ) -> Result<Vec<f32>, ApiError> {
     let mut outputs: Vec<Vec<f32>> = Vec::with_capacity(chunks.len());
     for chunk in chunks {

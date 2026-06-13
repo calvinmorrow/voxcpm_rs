@@ -8,6 +8,7 @@ use burn::{
     module::{Module, Param},
     nn::{Linear, LinearConfig},
     prelude::Backend,
+    tensor::backend::BackendTypes,
     tensor::{
         DType, Distribution, Int,
         activation::{silu, tanh},
@@ -650,8 +651,8 @@ impl VoxCPM<backend::LibTorch<bf16>> {
         _debug: bool,
         _stop_on_zero: bool,
         audio_vae: &AudioVae<backend::LibTorch<f32>>,
-        device: &<backend::LibTorch<bf16> as Backend>::Device,
-        adevice: &<backend::LibTorch<f32> as Backend>::Device,
+        device: &<backend::LibTorch<bf16> as BackendTypes>::Device,
+        adevice: &<backend::LibTorch<f32> as BackendTypes>::Device,
     ) -> Tensor<backend::LibTorch<f32>, 1> {
         let t_start = Instant::now();
         let latent_pred = self.generate_latent(
@@ -711,8 +712,8 @@ impl VoxCPM<backend::LibTorch<bf16>> {
         _debug: bool,
         _stop_on_zero: bool,
         audio_vae: &AudioVae<backend::LibTorch<f32>>,
-        device: &<backend::LibTorch<bf16> as Backend>::Device,
-        adevice: &<backend::LibTorch<f32> as Backend>::Device,
+        device: &<backend::LibTorch<bf16> as BackendTypes>::Device,
+        adevice: &<backend::LibTorch<f32> as BackendTypes>::Device,
     ) -> Tensor<backend::LibTorch<f32>, 1> {
         let t_start = Instant::now();
         let latent_pred = self.generate_latent_with_prompt_features(
@@ -774,8 +775,8 @@ impl VoxCPM<backend::LibTorch<f16>> {
         _debug: bool,
         _stop_on_zero: bool,
         audio_vae: &AudioVae<backend::LibTorch<f32>>,
-        device: &<backend::LibTorch<f16> as Backend>::Device,
-        adevice: &<backend::LibTorch<f32> as Backend>::Device,
+        device: &<backend::LibTorch<f16> as BackendTypes>::Device,
+        adevice: &<backend::LibTorch<f32> as BackendTypes>::Device,
     ) -> Tensor<backend::LibTorch<f32>, 1> {
         let t_start = Instant::now();
         let latent_pred = self.generate_latent(
@@ -835,8 +836,8 @@ impl VoxCPM<backend::LibTorch<f16>> {
         _debug: bool,
         _stop_on_zero: bool,
         audio_vae: &AudioVae<backend::LibTorch<f32>>,
-        device: &<backend::LibTorch<f16> as Backend>::Device,
-        adevice: &<backend::LibTorch<f32> as Backend>::Device,
+        device: &<backend::LibTorch<f16> as BackendTypes>::Device,
+        adevice: &<backend::LibTorch<f32> as BackendTypes>::Device,
     ) -> Tensor<backend::LibTorch<f32>, 1> {
         let t_start = Instant::now();
         let latent_pred = self.generate_latent_with_prompt_features(
@@ -1027,7 +1028,7 @@ impl<B: Backend> ScalarQuantizationLayer<B> {
         let hidden = self.in_proj.forward(hidden);
         let hidden = tanh(hidden);
 
-        let hidden = if B::ad_enabled() {
+        let hidden = if B::ad_enabled(&hidden.device()) {
             let quantized = (hidden.clone() * self.scale as u32).round() / self.scale as u32;
             hidden.clone() + (quantized - hidden).detach()
         } else {
