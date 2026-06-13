@@ -34,9 +34,15 @@ Migration plan: `docs/voxcpm2_migration_plan.md`
 - **Git Commit**: (pending)
 - **Deviations**: —
 
-### Step 0.3: Inspect VoxCPM2 Python Reference Code
+### Step 0.3: Analyze VoxCPM2 Config & Weight Keys
 
-- **Status**: Pending
+- **Status**: Complete
+- **Started**: 2026-06-12 23:21 PDT
+- **Completed**: 2026-06-12 23:25 PDT
+- **Verification**: docs/voxcpm2_weight_keys.md created (918 lines, 577 weight keys); config confirms architecture=voxcpm2, patch_size=4, 28 base_lm layers, 8 residual_lm layers, GQA 16/2
+- **Success Criteria Met**: Yes — config parameters documented, weight key list captured for Burn adapter mapping
+- **Git Commit**: 65beaef
+- **Deviations**: —
 
 ---
 
@@ -44,7 +50,13 @@ Migration plan: `docs/voxcpm2_migration_plan.md`
 
 ### Step 1.1: Create audio_vae_v2.rs Module
 
-- **Status**: Pending
+- **Status**: In Progress
+- **Started**: 2026-06-12 23:26 PDT
+- **Completed**: —
+- **Verification**: —
+- **Success Criteria Met**: —
+- **Git Commit**: —
+- **Deviations**: —
 
 ### Step 1.2: Add AudioVAE V2 to lib.rs
 
