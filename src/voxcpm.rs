@@ -96,7 +96,7 @@ impl VoxCPMConfig {
                 .encoder_config
                 .init(feat_encoder_lm_config, self.feat_dim, device),
             feat_decoder: self.dit_config.cfm_config.init(
-                VoxCPMLocDiTConfig::new(self.feat_dim),
+                VoxCPMLocDiTV2Config::new(self.feat_dim),
                 feat_decoder_lm_config,
                 self.feat_dim,
                 device,
@@ -1052,7 +1052,7 @@ pub struct UnifiedCFMConfig {
 impl UnifiedCFMConfig {
     pub fn init<B: Backend>(
         &self,
-        _dit_config: VoxCPMLocDiTConfig,
+        _dit_config: VoxCPMLocDiTV2Config,
         config: MiniCPMConfig,
         in_channels: usize,
         device: &B::Device,
@@ -1060,7 +1060,7 @@ impl UnifiedCFMConfig {
         UnifiedCFM {
             in_channels,
             mean_mode: false,
-            estimator: VoxCPMLocDiTConfig::new(in_channels).init(config, device),
+            estimator: VoxCPMLocDiTV2Config::new(in_channels).init(config, device),
         }
     }
 }
@@ -1069,7 +1069,7 @@ impl UnifiedCFMConfig {
 pub struct UnifiedCFM<B: Backend> {
     in_channels: usize,
     mean_mode: bool,
-    pub estimator: VoxCPMLocDiT<B>,
+    pub estimator: VoxCPMLocDiTV2<B>,
 }
 
 #[allow(clippy::too_many_arguments)]
