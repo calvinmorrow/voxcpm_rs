@@ -9,6 +9,7 @@ use burn_store::{
     BurnpackStore, ModuleSnapshot, PyTorchToBurnAdapter, PytorchStore, SafetensorsStore,
 };
 use clap::Parser;
+use serde_json::Value;
 use tch::Cuda;
 use voxcpm_rs::audiovae::AudioVae;
 use voxcpm_rs::voxcpm::{VoxCPM, VoxCPMConfig};
@@ -52,6 +53,211 @@ fn main() {
     );
 }
 
+/// Pre-process config JSON to be compatible with VoxCPMConfig struct.
+/// V2 configs may be missing fields that have defaults in the Rust struct.
+fn preprocess_config(config_path: &Path) -> Result<Value, Box<dyn std::error::Error>> {
+    let raw = std::fs::read_to_string(config_path)?;
+    let mut config: Value = serde_json::from_str(&raw)?;
+
+    // Add missing `no_rope` to lm_config (V2 has it at top level as residual_lm_no_rope)
+    if let Some(lm_config) = config.get_mut("lm_config").and_then(|v| v.as_object_mut()) {
+        if !lm_config.contains_key("no_rope") {
+            lm_config.insert("no_rope".to_string(), Value::Bool(false));
+        }
+    }
+
+    // Add missing `kv_channels` to lm_config if absent
+    if let Some(lm_config) = config.get_mut("lm_config").and_then(|v| v.as_object_mut()) {
+        if !lm_config.contains_key("kv_channels") {
+            lm_config.insert("kv_channels".to_string(), Value::Null);
+        }
+    }
+
+    // Add missing `rope_theta` to lm_config if absent
+    if let Some(lm_config) = config.get_mut("lm_config").and_then(|v| v.as_object_mut()) {
+        if !lm_config.contains_key("rope_theta") {
+            lm_config.insert(
+                "rope_theta".to_string(),
+                Value::Number(serde_json::Number::from(10000)),
+            );
+        }
+    }
+
+    // Add missing `dim_model_base` to lm_config if absent
+    if let Some(lm_config) = config.get_mut("lm_config").and_then(|v| v.as_object_mut()) {
+        if !lm_config.contains_key("dim_model_base") {
+            lm_config.insert(
+                "dim_model_base".to_string(),
+                Value::Number(serde_json::Number::from(256)),
+            );
+        }
+    }
+
+    // Add missing `scale_depth` to lm_config if absent
+    if let Some(lm_config) = config.get_mut("lm_config").and_then(|v| v.as_object_mut()) {
+        if !lm_config.contains_key("scale_depth") {
+            lm_config.insert(
+                "scale_depth".to_string(),
+                Value::Number(serde_json::Number::from_f64(1.0).unwrap()),
+            );
+        }
+    }
+
+    // Add missing top-level ref_audio tokens (V2 doesn't have them in config)
+    if !config
+        .as_object()
+        .unwrap()
+        .contains_key("ref_audio_start_token")
+    {
+        config["ref_audio_start_token"] = Value::Number(serde_json::Number::from(103));
+    }
+    if !config
+        .as_object()
+        .unwrap()
+        .contains_key("ref_audio_end_token")
+    {
+        config["ref_audio_end_token"] = Value::Number(serde_json::Number::from(104));
+    }
+
+    // Fix dit_config: V2 uses `mean_mode` but Rust expects `dit_mean_mode`
+    if let Some(dit) = config.get_mut("dit_config").and_then(|v| v.as_object_mut()) {
+        if let Some(mean_mode) = dit.remove("mean_mode") {
+            dit.insert("dit_mean_mode".to_string(), mean_mode);
+        } else if !dit.contains_key("dit_mean_mode") {
+            dit.insert("dit_mean_mode".to_string(), Value::Bool(false));
+        }
+        // Fix cfm_config: strip V2-only `inference_cfg_rate` field
+        if let Some(cfm) = dit.get_mut("cfm_config").and_then(|v| v.as_object_mut()) {
+            cfm.remove("inference_cfg_rate");
+        }
+    }
+
+    // Ensure audio_vae_config has required fields with defaults
+    if let Some(aud) = config
+        .get_mut("audio_vae_config")
+        .and_then(|v| v.as_object_mut())
+    {
+        if !aud.contains_key("depthwise") {
+            aud.insert("depthwise".to_string(), Value::Bool(true));
+        }
+        if !aud.contains_key("use_noise_block") {
+            aud.insert("use_noise_block".to_string(), Value::Bool(false));
+        }
+        // Strip V2-only fields that V1 AudioVaeConfig doesn't expect
+        aud.remove("sr_bin_boundaries");
+        aud.remove("out_sample_rate");
+        aud.remove("cond_type");
+        aud.remove("cond_dim");
+        aud.remove("cond_out_layer");
+    }
+
+    Ok(config)
+}
+
+/// Build key remappings for VoxCPM2 safetensors → Burn module field paths.
+/// V2 weights use `*.norm.weight` but Burn expects `*.norm.inner.gamma` due to
+/// MiniCPMRMSNorm wrapper struct. Generates remappings for all layer norms.
+fn build_key_remappings(
+    base_lm_layers: usize,
+    residual_lm_layers: usize,
+    encoder_layers: usize,
+    decoder_layers: usize,
+) -> Vec<(String, String)> {
+    let mut remaps = Vec::new();
+
+    // Top-level norms
+    remaps.push((
+        "base_lm.norm.weight".into(),
+        "base_lm.norm.inner.gamma".into(),
+    ));
+    remaps.push((
+        "residual_lm.norm.weight".into(),
+        "residual_lm.norm.inner.gamma".into(),
+    ));
+    remaps.push((
+        "feat_encoder.encoder.norm.weight".into(),
+        "feat_encoder.encoder.norm.inner.gamma".into(),
+    ));
+    remaps.push((
+        "feat_decoder.estimator.decoder.norm.weight".into(),
+        "feat_decoder.estimator.decoder.norm.inner.gamma".into(),
+    ));
+
+    // base_lm layer norms (input_layernorm + post_attention_layernorm per layer)
+    for i in 0..base_lm_layers {
+        remaps.push((
+            format!("base_lm.layers.{}.input_layernorm.weight", i),
+            format!("base_lm.layers.{}.input_layernorm.inner.gamma", i),
+        ));
+        remaps.push((
+            format!("base_lm.layers.{}.post_attention_layernorm.weight", i),
+            format!("base_lm.layers.{}.post_attention_layernorm.inner.gamma", i),
+        ));
+    }
+
+    // residual_lm layer norms
+    for i in 0..residual_lm_layers {
+        remaps.push((
+            format!("residual_lm.layers.{}.input_layernorm.weight", i),
+            format!("residual_lm.layers.{}.input_layernorm.inner.gamma", i),
+        ));
+        remaps.push((
+            format!("residual_lm.layers.{}.post_attention_layernorm.weight", i),
+            format!(
+                "residual_lm.layers.{}.post_attention_layernorm.inner.gamma",
+                i
+            ),
+        ));
+    }
+
+    // feat_encoder layer norms
+    for i in 0..encoder_layers {
+        remaps.push((
+            format!("feat_encoder.encoder.layers.{}.input_layernorm.weight", i),
+            format!(
+                "feat_encoder.encoder.layers.{}.input_layernorm.inner.gamma",
+                i
+            ),
+        ));
+        remaps.push((
+            format!(
+                "feat_encoder.encoder.layers.{}.post_attention_layernorm.weight",
+                i
+            ),
+            format!(
+                "feat_encoder.encoder.layers.{}.post_attention_layernorm.inner.gamma",
+                i
+            ),
+        ));
+    }
+
+    // feat_decoder layer norms
+    for i in 0..decoder_layers {
+        remaps.push((
+            format!(
+                "feat_decoder.estimator.decoder.layers.{}.input_layernorm.weight",
+                i
+            ),
+            format!(
+                "feat_decoder.estimator.decoder.layers.{}.input_layernorm.inner.gamma",
+                i
+            ),
+        ));
+        remaps.push((
+            format!(
+                "feat_decoder.estimator.decoder.layers.{}.post_attention_layernorm.weight",
+                i
+            ),
+            format!(
+                "feat_decoder.estimator.decoder.layers.{}.post_attention_layernorm.inner.gamma",
+                i
+            ),
+        ));
+    }
+
+    remaps
+}
+
 fn convert(input_path: &str, output_path: &str, device: Option<&str>, tts_dtype: TtsDtype) {
     let input_path = Path::new(input_path);
     let output_path = Path::new(output_path);
@@ -60,8 +266,41 @@ fn convert(input_path: &str, output_path: &str, device: Option<&str>, tts_dtype:
     }
     let tts_device = select_device(device);
     let audio_device = select_device(device);
-    let tts_config =
-        VoxCPMConfig::load(input_path.join("config.json")).expect("couldn't load model config");
+
+    // Pre-process config for compatibility
+    let config_value =
+        preprocess_config(&input_path.join("config.json")).expect("couldn't read model config");
+    let config_json = serde_json::to_string_pretty(&config_value)
+        .expect("couldn't serialize preprocessed config");
+
+    // Write preprocessed config to a temp location for loading
+    let temp_config_path = output_path.join("config_preprocessed.json");
+    std::fs::write(&temp_config_path, &config_json).expect("couldn't write preprocessed config");
+
+    let tts_config = VoxCPMConfig::load(&temp_config_path).expect("couldn't load model config");
+
+    // Extract layer counts for norm remapping generation
+    let base_lm_layers = config_value["lm_config"]["num_hidden_layers"]
+        .as_u64()
+        .unwrap_or(28) as usize;
+    let residual_lm_layers = config_value["residual_lm_num_layers"].as_u64().unwrap_or(8) as usize;
+    let encoder_layers = config_value["encoder_config"]["num_layers"]
+        .as_u64()
+        .unwrap_or(12) as usize;
+    let decoder_layers = config_value["dit_config"]["num_layers"]
+        .as_u64()
+        .unwrap_or(12) as usize;
+    let key_remappings = build_key_remappings(
+        base_lm_layers,
+        residual_lm_layers,
+        encoder_layers,
+        decoder_layers,
+    );
+    println!(
+        "Generated {} key remappings for norm layers",
+        key_remappings.len()
+    );
+
     match tts_dtype {
         TtsDtype::Bf16 => {
             type BTts = backend::LibTorch<bf16>;
@@ -69,8 +308,10 @@ fn convert(input_path: &str, output_path: &str, device: Option<&str>, tts_dtype:
             let mut store = SafetensorsStore::from_file(input_path.join("model.safetensors"))
                 .with_from_adapter(PyTorchToBurnAdapter)
                 .map_indices_contiguous(true)
-                .skip_enum_variants(true)
-                .with_key_remapping("norm.weight", "norm.inner.gamma");
+                .skip_enum_variants(true);
+            for (from, to) in &key_remappings {
+                store = store.with_key_remapping(from, to);
+            }
             println!("Loading TTS model tensors...");
             println!(
                 "{:?}",
@@ -92,8 +333,10 @@ fn convert(input_path: &str, output_path: &str, device: Option<&str>, tts_dtype:
             let mut store = SafetensorsStore::from_file(input_path.join("model.safetensors"))
                 .with_from_adapter(PyTorchToBurnAdapter)
                 .map_indices_contiguous(true)
-                .skip_enum_variants(true)
-                .with_key_remapping("norm.weight", "norm.inner.gamma");
+                .skip_enum_variants(true);
+            for (from, to) in &key_remappings {
+                store = store.with_key_remapping(from, to);
+            }
             println!("Loading TTS model tensors...");
             println!(
                 "{:?}",
