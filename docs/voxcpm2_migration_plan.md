@@ -8,6 +8,338 @@ Migrate `voxcpm_rs` from VoxCPM 1.5 to VoxCPM 2 support.
 **Weights**: [openbmb/VoxCPM2](https://huggingface.co/openbmb/VoxCPM2) on HuggingFace
 **Current**: VoxCPM 1.5 (`dev_1.5` branch) implementation in Rust/Burn
 
+## Implementation Progress Tracking
+
+All implementation progress must be recorded in `/a0/usr/projects/voxcpm_rs/docs/implementation.md` to enable checkpointing between sessions.
+
+### How to Use implementation.md
+
+**Before starting any step:**
+1. Append a `### Step X.Y: [Step Name]` section with `Status: In Progress` and current timestamp
+2. Note any prerequisites or dependencies on prior steps
+
+**After completing a step:**
+1. Update status to `Status: Complete` with completion timestamp
+2. Record verification commands run and their output
+3. Document success criteria met (pass/fail with evidence)
+4. Note git commit hash if code changes were committed
+
+**Format template for each step:**
+
+```markdown
+### Step X.Y: [Step Name]
+
+- **Status**: Complete | In Progress | Blocked
+- **Started**: 2026-06-12 22:58 PDT
+- **Completed**: 2026-06-12 23:45 PDT
+- **Verification**: [commands run + output summary]
+- **Success Criteria Met**: Yes/No + evidence
+- **Git Commit**: abc1234 (if applicable)
+- **Deviations**: [any deviations from plan, why, impact on future steps]
+```
+
+### Deviation Tracking
+
+Any deviation from this project plan must be explicitly documented:
+
+- **What changed**: Describe the deviation from the planned approach
+- **Why**: Reason for the deviation (discovery, blocker, optimization)
+- **Impact**: How this affects subsequent steps or success criteria
+- **Future consideration**: Notes for later steps to account for the change
+
+Example:
+```
+- **Deviations**:
+  - Used `hf download` instead of `huggingface-cli download` due to availability
+  - AudioVAE V2 weights are in `model.safetensors` (not separate file) — affects Step 5.1 conversion adapter
+  - Impact: Steps 5.1+ must handle combined weight file extraction
+```
+
+### Session Checkpoint Protocol
+
+At the end of each work session:
+1. Update all in-progress steps in `implementation.md`
+2. Commit `implementation.md` to git
+3. Note the last completed step and next step to resume
+4. If blocked, document blocker and suggested unblock path
+
+### Reading implementation.md at Session Start
+
+When resuming work:
+1. Read `implementation.md` to understand current state
+2. Identify last completed step and next pending step
+3. Review any deviations that may affect upcoming work
+4. Check for blockers from prior session
+
+---
+
+## Session Handoff & Subagent Protocol
+
+### Starting a New Implementation Session
+
+**Required reading order at session start:**
+
+1. `/a0/usr/projects/voxcpm_rs/AGENTS.md` — Root DOX framework + project rules
+2. `/a0/usr/projects/voxcpm_rs/docs/voxcpm2_migration_plan.md` — This file (full 20-step plan)
+3. `/a0/usr/projects/voxcpm_rs/docs/implementation.md` — Current progress (if exists)
+4. `/a0/usr/projects/voxcpm_rs/src/AGENTS.md` — Library module documentation
+5. `/a0/usr/projects/voxcpm_rs/src/bin/AGENTS.md` — Binary entry point documentation
+
+**Check current state:**
+```bash
+cd /a0/usr/projects/voxcpm_rs
+git status
+git log --oneline -5
+```
+
+**Identify next step:**
+- If `docs/implementation.md` exists, find the first step with `Status: In Progress` or no entry
+- If all steps are `Status: Complete`, the migration is done
+
+### Subagent Delegation Strategy
+
+**Goal:** Keep the main agent context small by delegating implementation steps to subagents with complete instructions, then validating results before proceeding.
+
+**Delegate to subagents for:**
+- Individual implementation steps (Phase 0-8)
+- Code changes with clear scope and success criteria
+- Independent verification tasks
+
+**Keep in main agent for:**
+- Session coordination and progress tracking
+- Cross-step dependencies and blocking issues
+- Final validation and git commits
+- Plan deviations and architectural decisions
+
+### Subagent Prompt Template
+
+When delegating a step, use this structure:
+
+```
+## Role
+Rust developer implementing VoxCPM2 migration step.
+
+## Context
+- Project: /a0/usr/projects/voxcpm_rs (VoxCPM Rust/Burn implementation)
+- Branch: openai
+- Current step: Step X.Y - [Step Name]
+- Migration plan: /a0/usr/projects/voxcpm_rs/docs/voxcpm2_migration_plan.md
+- Upstream reference: /tmp/voxcpm_main/ (VoxCPM2 Python source)
+
+## Task
+[Copy the exact step description from the migration plan]
+
+## Constraints
+- Follow DOX framework in AGENTS.md
+- Read relevant AGENTS.md files before editing code
+- Make minimal focused changes matching existing style
+- Use `cargo fmt` before completing
+- Do not edit tests/docs/lockfiles unless required
+
+## Success Criteria
+[Copy the exact success criteria from the migration plan]
+
+## Verification Commands
+[Copy the exact verification commands from the migration plan]
+
+## Deliverables
+1. Code changes that compile with `cargo build --release`
+2. Verification output proving success criteria met
+3. Summary of changes made
+```
+
+### Step Execution Workflow
+
+For each step:
+
+1. **Read the step** from this migration plan
+2. **Update implementation.md** with `Status: In Progress` and start timestamp
+3. **Delegate to subagent** with the prompt template above
+4. **Validate subagent work**:
+   - Run `cargo build --release` — must compile without errors
+   - Run verification commands from the plan — must produce expected output
+   - Confirm success criteria are explicitly met
+5. **Git commit** changes:
+   ```bash
+   git add -A
+   git commit -m "step X.Y: [brief description]"
+   ```
+6. **Update implementation.md** with completion details, verification output, and commit hash
+7. **Move to next step** or checkpoint session
+
+### Validation Checklist
+
+Before marking a step complete:
+
+- [ ] Code compiles without errors (`cargo build --release`)
+- [ ] Verification commands produce expected output
+- [ ] Success criteria explicitly met with evidence
+- [ ] Changes committed to git with descriptive message
+- [ ] implementation.md updated with completion details
+- [ ] No unintended side effects (check git diff)
+
+### Git Commit Discipline
+
+- **Commit between every step** — never accumulate multiple steps in one commit
+- **Commit message format:** `step X.Y: [brief description]`
+- **Include implementation.md** in the commit if updated
+- **If a step fails:** Commit the partial work with `step X.Y: [description] - incomplete` and document blocker
+
+### Document Quick Reference
+
+| Document | Location | Purpose |
+|----------|----------|---------|
+| Migration Plan | `docs/voxcpm2_migration_plan.md` | 20-step implementation plan (this file) |
+| Progress Tracker | `docs/implementation.md` | Session checkpointing, step status |
+| Handoff Instructions | `docs/handoff_instructions.md` | Detailed session management guide |
+| Root DOX | `AGENTS.md` | Project rules + DOX framework |
+| Library DOX | `src/AGENTS.md` | Module documentation |
+| Binary DOX | `src/bin/AGENTS.md` | Binary documentation |
+| Upstream 1.5 | `/tmp/voxcpm_1.5/` | Reference Python code (dev_1.5 branch) |
+| Upstream main | `/tmp/voxcpm_main/` | VoxCPM2 reference code (main branch) |
+
+---
+
+## Session Management & Implementation Protocol
+
+### Progress Tracking: implementation.md
+
+All implementation progress must be recorded in `/a0/usr/projects/voxcpm_rs/docs/implementation.md` to enable checkpointing between sessions.
+
+**Before starting any step:**
+1. Create or append to `docs/implementation.md` with a `### Step X.Y: [Step Name]` section
+2. Set `Status: In Progress` and record current timestamp
+3. Note any prerequisites or dependencies on prior steps
+
+**After completing a step:**
+1. Update status to `Status: Complete` with completion timestamp
+2. Record verification commands run and their output
+3. Document success criteria met (pass/fail with evidence)
+4. Note git commit hash if code changes were committed
+5. **Git commit** both code changes AND implementation.md
+
+**Format template for each step in implementation.md:**
+
+```markdown
+### Step X.Y: [Step Name]
+
+- **Status**: Complete | In Progress | Blocked
+- **Started**: 2026-06-12 23:05 PDT
+- **Completed**: 2026-06-12 23:45 PDT
+- **Verification**: [commands run + output summary]
+- **Success Criteria Met**: Yes/No + evidence
+- **Git Commit**: abc1234 (if applicable)
+- **Deviations**: [any deviations from plan, why, impact on future steps]
+```
+
+### Subagent Delegation Strategy
+
+**Goal:** Keep the main agent context small by delegating implementation steps to subagents with complete instructions, then validating results before proceeding.
+
+**Delegate to subagents for:**
+- Individual implementation steps (Phase 0-8)
+- Code changes with clear scope and success criteria
+- Independent verification tasks
+
+**Keep in main agent for:**
+- Session coordination and progress tracking
+- Cross-step dependencies and blocking issues
+- Final validation and git commits
+- Plan deviations and architectural decisions
+
+### Subagent Prompt Template
+
+When delegating a step, use this structure:
+
+```
+## Role
+Rust developer implementing VoxCPM2 migration step.
+
+## Context
+- Project: /a0/usr/projects/voxcpm_rs (VoxCPM Rust/Burn implementation)
+- Branch: openai
+- Current step: Step X.Y - [Step Name]
+- Migration plan: /a0/usr/projects/voxcpm_rs/docs/voxcpm2_migration_plan.md
+
+## Task
+[Copy the exact step description from the migration plan]
+
+## Constraints
+- Follow DOX framework in AGENTS.md
+- Read relevant AGENTS.md files before editing code
+- Make minimal focused changes matching existing style
+- Use `cargo fmt` before completing
+- Do not edit tests/docs/lockfiles unless required
+
+## Success Criteria
+[Copy the exact success criteria from the migration plan]
+
+## Verification Commands
+[Copy the exact verification commands from the migration plan]
+
+## Deliverables
+1. Code changes that compile with `cargo build --release`
+2. Verification output proving success criteria met
+3. Summary of changes made
+```
+
+### Step Execution Workflow
+
+For each step:
+
+1. **Read the step** from this migration plan
+2. **Update implementation.md** with `Status: In Progress` and start timestamp
+3. **Delegate to subagent** with the prompt template above
+4. **Validate subagent work**:
+   - Run `cargo build --release` — must compile without errors
+   - Run verification commands from the plan — must produce expected output
+   - Confirm success criteria are explicitly met
+5. **Git commit** changes:
+   ```bash
+   git add -A
+   git commit -m "step X.Y: [brief description]"
+   ```
+6. **Update implementation.md** with completion details, verification output, and commit hash
+7. **Move to next step** or checkpoint session
+
+### Session Handoff Protocol
+
+**Before ending a session:**
+1. Update `docs/implementation.md` with current status of all in-progress steps
+2. Commit all changes including implementation.md
+3. Note the next step to resume in implementation.md
+4. If blocked, document blocker and suggested unblock path
+
+**When resuming a session:**
+1. Read `docs/implementation.md` to understand current state
+2. Check git status for uncommitted changes
+3. Identify last completed step and next pending step
+4. Review any deviations noted in implementation.md
+5. Resume from the first incomplete step
+
+### Deviation Tracking
+
+Any deviation from this project plan must be explicitly documented in implementation.md:
+
+- **What changed**: Describe the deviation from the planned approach
+- **Why**: Reason for the deviation (discovery, blocker, optimization)
+- **Impact**: How this affects subsequent steps or success criteria
+- **Future consideration**: Notes for later steps to account for the change
+
+### Document Quick Reference
+
+| Document | Location | Purpose |
+|----------|----------|---------|
+| Migration Plan | `docs/voxcpm2_migration_plan.md` | This file — 20-step implementation plan |
+| Progress Tracker | `docs/implementation.md` | Session checkpointing, step status |
+| Root DOX | `AGENTS.md` | Project rules + DOX framework |
+| Library DOX | `src/AGENTS.md` | Module documentation |
+| Binary DOX | `src/bin/AGENTS.md` | Binary documentation |
+| Upstream 1.5 | `/tmp/voxcpm_1.5/` | Reference Python code (dev_1.5 branch) |
+| Upstream main | `/tmp/voxcpm_main/` | VoxCPM2 reference code (main branch) |
+
+---
+
 ## Key Architectural Changes (1.5 → 2)
 
 | Component | VoxCPM 1.5 | VoxCPM 2 | Impact |
