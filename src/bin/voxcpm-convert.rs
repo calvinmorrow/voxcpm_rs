@@ -267,17 +267,16 @@ fn convert(input_path: &str, output_path: &str, device: Option<&str>, tts_dtype:
     let tts_device = select_device(device);
     let audio_device = select_device(device);
 
-    // Pre-process config for compatibility
+    // Pre-process config for compatibility and save as config.json
     let config_value =
         preprocess_config(&input_path.join("config.json")).expect("couldn't read model config");
     let config_json = serde_json::to_string_pretty(&config_value)
         .expect("couldn't serialize preprocessed config");
 
-    // Write preprocessed config to a temp location for loading
-    let temp_config_path = output_path.join("config_preprocessed.json");
-    std::fs::write(&temp_config_path, &config_json).expect("couldn't write preprocessed config");
+    let config_output_path = output_path.join("config.json");
+    std::fs::write(&config_output_path, &config_json).expect("couldn't write config.json");
 
-    let tts_config = VoxCPMConfig::load(&temp_config_path).expect("couldn't load model config");
+    let tts_config = VoxCPMConfig::load(&config_output_path).expect("couldn't load model config");
 
     // Extract layer counts for norm remapping generation
     let base_lm_layers = config_value["lm_config"]["num_hidden_layers"]
@@ -374,11 +373,6 @@ fn convert(input_path: &str, output_path: &str, device: Option<&str>, tts_dtype:
             .save_into(&mut store)
             .expect("couldn't save audio_vae model to burnpack")
     );
-    std::fs::copy(
-        input_path.join("config.json"),
-        output_path.join("config.json"),
-    )
-    .expect("couldn't copy model config");
     std::fs::copy(
         input_path.join("tokenizer.json"),
         output_path.join("tokenizer.json"),

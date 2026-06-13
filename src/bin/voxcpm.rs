@@ -296,10 +296,33 @@ fn select_device(override_device: Option<&str>) -> LibTorchDevice {
     } else {
         0
     };
+
+    // Diagnostics for ROCm/CUDA detection
+    let libtorch_use_pytorch = std::env::var("LIBTORCH_USE_PYTORCH").ok();
+    let hsa_override = std::env::var("HSA_OVERRIDE_GFX_VERSION").ok();
+    let rocm_visible = std::env::var("ROCR_VISIBLE_DEVICES").ok();
+    let ld_lib_path = std::env::var("LD_LIBRARY_PATH").ok();
+
     println!(
         "Device probe: cuda_available={}, cuda_device_count={}",
         cuda_available, cuda_count
     );
+    if let Some(ref v) = libtorch_use_pytorch {
+        println!("  LIBTORCH_USE_PYTORCH={}", v);
+    } else {
+        println!("  LIBTORCH_USE_PYTORCH not set (using bundled LibTorch)");
+    }
+    if let Some(ref v) = hsa_override {
+        println!("  HSA_OVERRIDE_GFX_VERSION={}", v);
+    }
+    if let Some(ref v) = rocm_visible {
+        println!("  ROCR_VISIBLE_DEVICES={}", v);
+    }
+    if let Some(ref v) = ld_lib_path {
+        let has_rocm = v.contains("rocm") || v.contains("hip");
+        println!("  LD_LIBRARY_PATH has ROCm/HIP libs: {}", has_rocm);
+    }
+
     if let Some(override_device) = override_device {
         let selected = parse_device_override(override_device);
         println!(
@@ -308,13 +331,20 @@ fn select_device(override_device: Option<&str>) -> LibTorchDevice {
         );
         return selected;
     }
-    if Cuda::is_available() && Cuda::device_count() > 0 {
+    if cuda_available && cuda_count > 0 {
         let selected = LibTorchDevice::Cuda(0);
         println!("Device auto-select: selected={:?}", selected);
         return selected;
     }
     let selected = LibTorchDevice::Cpu;
     println!("Device auto-select: selected={:?}", selected);
+    if !cuda_available {
+        eprintln!("WARNING: CUDA/ROCm not detected, falling back to CPU.");
+        eprintln!("  For ROCm (AMD GPU), rebuild with LIBTORCH_USE_PYTORCH=1");
+        eprintln!("  pointing to a ROCm-enabled PyTorch installation.");
+        eprintln!("  For gfx1102 (RX 7700 XT), also set HSA_OVERRIDE_GFX_VERSION=11.0.0.");
+        eprintln!("  Alternatively, use --device cuda to force GPU mode.");
+    }
     selected
 }
 
@@ -323,10 +353,20 @@ fn parse_device_override(device: &str) -> LibTorchDevice {
     if normalized == "cpu" {
         return LibTorchDevice::Cpu;
     }
-    if normalized == "cuda" {
+    if normalized == "cuda" || normalized == "rocm" || normalized == "hip" {
         return LibTorchDevice::Cuda(0);
     }
     if let Some(index) = normalized.strip_prefix("cuda:") {
+        if let Ok(index) = index.parse::<usize>() {
+            return LibTorchDevice::Cuda(index);
+        }
+    }
+    if let Some(index) = normalized.strip_prefix("rocm:") {
+        if let Ok(index) = index.parse::<usize>() {
+            return LibTorchDevice::Cuda(index);
+        }
+    }
+    if let Some(index) = normalized.strip_prefix("hip:") {
         if let Ok(index) = index.parse::<usize>() {
             return LibTorchDevice::Cuda(index);
         }

@@ -11,9 +11,25 @@
 - `cargo build --release`: build the optimized binary.
 - `cargo run --release --bin voxcpm-convert --features convert -- --input-path ../VoxCPM-0.5B/ --output-path burn-models/`: convert HuggingFace weights to Burn format.
 - `cargo run --release --bin voxcpm-convert --features convert -- --input-path /tmp/voxcpm2_weights --output-path burn-models-voxcpm2 --tts-dtype bf16`: convert VoxCPM2 weights.
-- `cargo run --release --bin voxcpm run --model-path burn-models/ --target-text '...'`: run TTS; writes `output.wav`.
+- `cargo run --release --bin voxcpm -- run --model-path burn-models/ --target-text '...'`: run TTS; writes `output.wav`.
 - `mpv output.wav`: play the generated audio.
-- Note: VoxCPM2 (2B params) requires CUDA for practical inference; CPU is extremely slow.
+- Note: VoxCPM2 (2B params) requires CUDA/ROCm for practical inference; CPU is extremely slow.
+
+## ROCm (AMD GPU) Build Instructions
+
+For ROCm-enabled builds, use the system PyTorch instead of bundled CPU-only LibTorch:
+
+```bash
+export HSA_OVERRIDE_GFX_VERSION=11.0.0  # for RX 7700 XT (gfx1102)
+export LIBTORCH_USE_PYTORCH=1
+export LIBTORCH=/opt/venv/lib/python3.12/site-packages/torch  # adjust path
+export LD_LIBRARY_PATH=$LIBTORCH/lib:$LD_LIBRARY_PATH
+cargo build --release
+```
+
+Or build with the provided `Dockerfile.rocm` which uses `rocm/pytorch:rocm7.1.1_ubuntu24.04_py3.12_pytorch_release_2.9.1`.
+
+At runtime, use `--device cuda` (or `--device rocm` / `--device hip`) to force GPU mode. The binary prints diagnostic output showing `LIBTORCH_USE_PYTORCH`, `HSA_OVERRIDE_GFX_VERSION`, and `LD_LIBRARY_PATH` status on startup.
 
 ## Coding Style & Naming Conventions
 - Rust 2024 edition; keep files/modules in `snake_case` and types in `CamelCase`.
