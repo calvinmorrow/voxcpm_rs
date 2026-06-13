@@ -1351,6 +1351,87 @@ impl<B: Backend> VoxCPMLocDiT<B> {
     }
 }
 
+// ─── VoxCPM LocDiT V2 ────────────────────────────────────────────────────────
+// V2 difference: mu and t are separate sequence tokens (not added together).
+// cat([mu, t, cond, x]) instead of cat([mu+t, cond, x])
+
+#[derive(Debug, Config)]
+pub struct VoxCPMLocDiTV2Config {
+    in_channels: usize,
+}
+
+impl VoxCPMLocDiTV2Config {
+    pub fn init<B: Backend>(&self, config: MiniCPMConfig, device: &B::Device) -> VoxCPMLocDiTV2<B> {
+        let out_channels = self.in_channels;
+        VoxCPMLocDiTV2 {
+            in_proj: LinearConfig::new(self.in_channels, config.hidden_size)
+                .with_bias(true)
+                .init(device),
+            cond_proj: LinearConfig::new(self.in_channels, config.hidden_size)
+                .with_bias(true)
+                .init(device),
+            out_proj: LinearConfig::new(config.hidden_size, out_channels)
+                .with_bias(true)
+                .init(device),
+            time_embeddings: SinusoidalPosEmbConfig::new(config.hidden_size).init(device),
+            time_mlp: TimestepEmbeddingConfig::new(config.hidden_size, config.hidden_size)
+                .init(device),
+            delta_time_mlp: TimestepEmbeddingConfig::new(config.hidden_size, config.hidden_size)
+                .init(device),
+            decoder: config.init(None, device),
+        }
+    }
+}
+
+#[derive(Module, Debug)]
+pub struct VoxCPMLocDiTV2<B: Backend> {
+    pub in_proj: Linear<B>,
+    cond_proj: Linear<B>,
+    out_proj: Linear<B>,
+    pub time_embeddings: SinusoidalPosEmb<B>,
+    pub time_mlp: TimestepEmbedding<B>,
+    delta_time_mlp: TimestepEmbedding<B>,
+    decoder: MiniCPMModel<B>,
+}
+
+impl<B: Backend> VoxCPMLocDiTV2<B> {
+    pub fn forward(
+        &self,
+        x: Tensor<B, 3>,
+        mu: Tensor<B, 2>,
+        t: Tensor<B, 1>,
+        cond: Tensor<B, 3>,
+        dt: Tensor<B, 1>,
+    ) -> Tensor<B, 3> {
+        //VoxCPMLocDiTV2 x: (2, 64, 2), mu: (2, 1024), t: (2,), cond: (2, 64, 2), dt: (2,)
+        let x = self.in_proj.forward(x.swap_dims(1, 2));
+        let cond = self.cond_proj.forward(cond.swap_dims(1, 2));
+        let prefix = cond.dims()[1];
+
+        let t = self.time_embeddings.forward(t, None).cast(x.dtype());
+        let t = self.time_mlp.forward(t);
+        let dt = self.time_embeddings.forward(dt, None).cast(x.dtype());
+        let dt = self.delta_time_mlp.forward(dt);
+        let t = t + dt;
+
+        // V2: mu reshaped to (N, 1, H) as its own token; t as separate token
+        let hidden_size = x.dims()[2];
+        let mu_batch = mu.dims()[0];
+        let mu = mu.reshape([mu_batch, 1, hidden_size]);
+        let mu_size = mu.dims()[1];
+        let t = t.unsqueeze_dim(1);
+
+        let x = Tensor::cat(vec![mu, t, cond, x], 1);
+
+        let (hidden, _) = self.decoder.forward(x, false);
+        let hidden = hidden.slice([s![..], s![prefix + mu_size + 1..], s![..]]);
+        let hidden = self.out_proj.forward(hidden);
+
+        //VoxCPMLocDiTV2 out: (2, 64, 2)
+        hidden.swap_dims(1, 2)
+    }
+}
+
 #[derive(Debug, Config)]
 pub struct SinusoidalPosEmbConfig {
     dim: usize,
