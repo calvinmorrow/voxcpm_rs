@@ -20,6 +20,7 @@ use burn::{
 use burn::backend;
 use burn::prelude::*;
 use burn::tensor::TensorPrimitive;
+
 use kdam::tqdm;
 use tokenizers::Tokenizer;
 
@@ -674,13 +675,12 @@ impl VoxCPM<backend::LibTorch<bf16>> {
         );
         let t_latent = t_start.elapsed();
 
-        // Keep the cast and device move on GPU to avoid CPU round-trips.
+        // Cast bf16 latent to f32 and move to audio device on GPU to avoid CPU round-trips.
         let primitive = latent_pred.into_primitive();
-        let tensor = primitive
-            .tensor()
-            .tensor
-            .to_device((*adevice).into())
-            .to_kind(tch::Kind::Float);
+        let tensor = match primitive {
+            TensorPrimitive::Float(t) => t.tensor.to_device((*adevice).into()).to_dtype(tch::Kind::Float, false, false),
+            _ => panic!("unexpected dtype for latent_pred"),
+        };
         let latent_pred = Tensor::from_primitive(TensorPrimitive::Float(
             burn::backend::libtorch::TchTensor::new(tensor),
         ));
@@ -735,13 +735,14 @@ impl VoxCPM<backend::LibTorch<bf16>> {
         );
         let t_latent = t_start.elapsed();
 
-        // Keep the cast and device move on GPU to avoid CPU round-trips.
+        // Cast bf16 latent to f32 and move to audio device on GPU to avoid CPU round-trips.
         let primitive = latent_pred.into_primitive();
-        let tensor = primitive
-            .tensor()
-            .tensor
-            .to_device((*adevice).into())
-            .to_kind(tch::Kind::Float);
+        let tensor = match primitive {
+            TensorPrimitive::Float(t) => {
+                t.tensor.to_device((*adevice).into()).to_dtype(tch::Kind::Float, false, false)
+            }
+            _ => panic!("unexpected dtype for latent_pred"),
+        };
         let latent_pred = Tensor::from_primitive(TensorPrimitive::Float(
             burn::backend::libtorch::TchTensor::new(tensor),
         ));
@@ -798,13 +799,12 @@ impl VoxCPM<backend::LibTorch<f16>> {
         );
         let t_latent = t_start.elapsed();
 
-        // Keep the cast and device move on GPU to avoid CPU round-trips.
+        // Cast f16 latent to f32 and move to audio device on GPU to avoid CPU round-trips.
         let primitive = latent_pred.into_primitive();
-        let tensor = primitive
-            .tensor()
-            .tensor
-            .to_device((*adevice).into())
-            .to_kind(tch::Kind::Float);
+        let tensor = match primitive {
+            TensorPrimitive::Float(t) => t.tensor.to_device((*adevice).into()).to_dtype(tch::Kind::Float, false, false),
+            _ => panic!("unexpected dtype for latent_pred"),
+        };
         let latent_pred = Tensor::from_primitive(TensorPrimitive::Float(
             burn::backend::libtorch::TchTensor::new(tensor),
         ));
@@ -859,13 +859,12 @@ impl VoxCPM<backend::LibTorch<f16>> {
         );
         let t_latent = t_start.elapsed();
 
-        // Keep the cast and device move on GPU to avoid CPU round-trips.
+        // Cast f16 latent to f32 and move to audio device on GPU to avoid CPU round-trips.
         let primitive = latent_pred.into_primitive();
-        let tensor = primitive
-            .tensor()
-            .tensor
-            .to_device((*adevice).into())
-            .to_kind(tch::Kind::Float);
+        let tensor = match primitive {
+            TensorPrimitive::Float(t) => t.tensor.to_device((*adevice).into()).to_dtype(tch::Kind::Float, false, false),
+            _ => panic!("unexpected dtype for latent_pred"),
+        };
         let latent_pred = Tensor::from_primitive(TensorPrimitive::Float(
             burn::backend::libtorch::TchTensor::new(tensor),
         ));
