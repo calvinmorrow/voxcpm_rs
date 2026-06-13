@@ -484,10 +484,11 @@ impl<B: Backend> WNCausalTransposeConv1d<B> {
                 .sqrt();
         let w = self.weight_g.val() * v;
 
+        let dtype = x.dtype();
         let out = conv_transpose1d(
             x,
             w,
-            self.bias.clone().map(|x| x.val()),
+            self.bias.clone().map(|b| b.val().cast(dtype)),
             ConvTransposeOptions::<1>::new([self.stride], [0], [0], [1], 1),
         );
 
@@ -587,9 +588,9 @@ impl<B: Backend> WNCausalConv1d<B> {
         let x = x.pad((self.padding * 2, 0, 0, 0), PadMode::Constant(0.0));
 
         conv1d(
-            x,
+            x.clone(),
             w,
-            self.bias.clone().map(|x| x.val()),
+            self.bias.clone().map(|b| b.val().cast(x.dtype())),
             ConvOptions::<1>::new([self.stride], [0], [self.dilation], self.groups),
         )
     }
