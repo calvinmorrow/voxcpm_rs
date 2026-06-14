@@ -822,14 +822,17 @@ pub struct WNCausalConv1dV2<B: Backend> {
 
 impl<B: Backend> WNCausalConv1dV2<B> {
     pub fn forward(&self, x: Tensor<B, 3>) -> Tensor<B, 3> {
-        let v = self.weight_v.val().clone()
-            / self
-                .weight_v
-                .val()
+        let dtype = x.dtype();
+        // Cast weights to input dtype first to avoid BF16/Float32 mismatch on ROCm
+        let weight_v = self.weight_v.val().cast(dtype);
+        let weight_g = self.weight_g.val().cast(dtype);
+
+        let v = weight_v.clone()
+            / weight_v
                 .powf_scalar(2.0)
                 .sum_dims(&[2, 1])
                 .sqrt();
-        let w = self.weight_g.val() * v;
+        let w = weight_g * v;
 
         // Causal: left-pad only (V2 semantics)
         let x = if self.causal_padding > 0 {
@@ -838,8 +841,6 @@ impl<B: Backend> WNCausalConv1dV2<B> {
             x
         };
 
-        let dtype = x.dtype();
-        let w = w.cast(dtype);
         conv1d(
             x.clone(),
             w,
@@ -898,16 +899,18 @@ pub struct WNCausalTransposeConv1dV2<B: Backend> {
 
 impl<B: Backend> WNCausalTransposeConv1dV2<B> {
     pub fn forward(&self, x: Tensor<B, 3>) -> Tensor<B, 3> {
-        let v = self.weight_v.val().clone()
-            / self
-                .weight_v
-                .val()
+        let dtype = x.dtype();
+        // Cast weights to input dtype first to avoid BF16/Float32 mismatch on ROCm
+        let weight_v = self.weight_v.val().cast(dtype);
+        let weight_g = self.weight_g.val().cast(dtype);
+
+        let v = weight_v.clone()
+            / weight_v
                 .powf_scalar(2.0)
                 .sum_dims(&[2, 1])
                 .sqrt();
-        let w = self.weight_g.val() * v;
+        let w = weight_g * v;
 
-        let dtype = x.dtype();
         let out = conv_transpose1d(
             x,
             w,
