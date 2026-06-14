@@ -91,19 +91,16 @@ impl<B: Backend> AudioVae<B> {
         audio_date.pad((right_pad, 0, 0, 0), PadMode::Constant(0.0))
     }
     pub fn decode(&self, z: Tensor<B, 3>) -> Tensor<B, 3> {
-        // Force f32 on ROCm: convert via tch primitives to guarantee dtype
-        let z = z.cast(burn::tensor::DType::F32);
-        // Verify and force at tch level
-        let prim = z.clone().into_primitive();
+        // Force f32 at tch level to avoid bf16/f32 mismatch on ROCm
+        let prim = z.into_primitive();
         let z = match prim {
             burn::tensor::TensorPrimitive::Float(t) => {
-                // Force f32 dtype at the tch level
                 let tch_tensor = t.tensor.to_dtype(tch::Kind::Float, true, true);
                 Tensor::from_primitive(burn::tensor::TensorPrimitive::Float(
                     burn::backend::libtorch::TchTensor::new(tch_tensor),
                 ))
             }
-            _ => z, // Already f32 or non-float
+            other => Tensor::from_primitive(other),
         };
         self.decoder.forward(z)
     }
