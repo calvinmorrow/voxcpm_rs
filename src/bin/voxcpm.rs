@@ -378,7 +378,15 @@ fn resolve_model_path(model_path: &str, tts_dtype: TtsDtype) -> std::path::PathB
     let base = Path::new(model_path);
     match base.file_name().and_then(|name| name.to_str()) {
         Some(name) if name == tts_dtype.as_str() => base.to_path_buf(),
-        _ => base.join(tts_dtype.as_str()),
+        _ => {
+            let dtype_path = base.join(tts_dtype.as_str());
+            if dtype_path.join("config.json").exists() {
+                dtype_path
+            } else {
+                // Flat layout: config.json at top level (e.g., VoxCPM2)
+                base.to_path_buf()
+            }
+        }
     }
 }
 

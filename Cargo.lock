@@ -1017,8 +1017,6 @@ dependencies = [
 [[package]]
 name = "burn-tch"
 version = "0.21.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "dfa36b630bd7a790395b4561f7d0e315c0d5e1c557db7dd4cf1b48d5c0d4aff2"
 dependencies = [
  "burn-backend",
  "cc",

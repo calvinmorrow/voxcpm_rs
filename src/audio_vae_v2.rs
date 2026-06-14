@@ -839,6 +839,7 @@ impl<B: Backend> WNCausalConv1dV2<B> {
         };
 
         let dtype = x.dtype();
+        let w = w.cast(dtype);
         conv1d(
             x.clone(),
             w,

@@ -8,10 +8,10 @@
 - Supports both VoxCPM 1.5 and VoxCPM 2 architectures (48kHz, patch_size=4, LocDiT V2, fusion_concat_proj).
 
 ## Build, Test, and Development Commands
-- `cargo build --release`: build the optimized binary.
+- `cargo build --release`: build the optimized binary (requires ROCm env vars below).
 - `cargo run --release --bin voxcpm-convert --features convert -- --input-path ../VoxCPM-0.5B/ --output-path burn-models/`: convert HuggingFace weights to Burn format.
 - `cargo run --release --bin voxcpm-convert --features convert -- --input-path /tmp/voxcpm2_weights --output-path burn-models-voxcpm2 --tts-dtype bf16`: convert VoxCPM2 weights.
-- `cargo run --release --bin voxcpm -- run --model-path burn-models/ --target-text '...'`: run TTS; writes `output.wav`.
+- `cargo run --release --bin voxcpm -- --model-path burn-models/ --target-text '...'`: run TTS; writes `output.wav`.
 - `mpv output.wav`: play the generated audio.
 - Note: VoxCPM2 (2B params) requires CUDA/ROCm for practical inference; CPU is extremely slow.
 
@@ -22,10 +22,13 @@ For ROCm-enabled builds, use the system PyTorch instead of bundled CPU-only LibT
 ```bash
 export HSA_OVERRIDE_GFX_VERSION=11.0.0  # for RX 7700 XT (gfx1102)
 export LIBTORCH_USE_PYTORCH=1
-export LIBTORCH=/opt/venv/lib/python3.12/site-packages/torch  # adjust path
+export LIBTORCH=/opt/venv/lib/python3.13/site-packages/torch  # adjust path to your venv
 export LD_LIBRARY_PATH=$LIBTORCH/lib:$LD_LIBRARY_PATH
+export LIBTORCH_BYPASS_VERSION_CHECK=1  # required when PyTorch version differs from tch-rs expectation
 cargo build --release
 ```
+
+**PyTorch 2.12 Compatibility**: The project uses a local patched `burn-tch` (in `local-patches/burn-tch/`) via `[patch.crates-io]` in `Cargo.toml` to fix the `at::cuda::getCurrentCUDABlasHandle()` API change in PyTorch 2.12 (now requires a `bool` argument). Do not remove the `local-patches/` directory or the `[patch.crates-io]` section.
 
 Or build with the provided `Dockerfile.rocm` which uses `rocm/pytorch:rocm7.1.1_ubuntu24.04_py3.12_pytorch_release_2.9.1`.
 

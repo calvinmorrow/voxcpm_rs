@@ -483,6 +483,7 @@ impl<B: Backend> WNCausalTransposeConv1d<B> {
                 .sum_dims(&[2, 1])
                 .sqrt();
         let w = self.weight_g.val() * v;
+        let w = w.cast(x.dtype());
 
         let dtype = x.dtype();
         let out = conv_transpose1d(
@@ -584,6 +585,7 @@ impl<B: Backend> WNCausalConv1d<B> {
                 .sqrt();
 
         let w = self.weight_g.val() * v;
+        let w = w.cast(x.dtype());
 
         let x = x.pad((self.padding * 2, 0, 0, 0), PadMode::Constant(0.0));
 

@@ -29,6 +29,5 @@ name = "voxcpm-convert"
 path = "src/bin/voxcpm-convert.rs"
 required-features = ["convert"]
 
-#[patch.crates-io]
-#tch = { path = "../tch-rs"}
-#torch-sys = { path = "../tch-rs/torch-sys"}
+[patch.crates-io]
+burn-tch = { path = "local-patches/burn-tch" }
