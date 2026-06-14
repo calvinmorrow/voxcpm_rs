@@ -678,7 +678,10 @@ impl VoxCPM<backend::LibTorch<bf16>> {
         // Cast bf16 latent to f32 and move to audio device on GPU to avoid CPU round-trips.
         let primitive = latent_pred.into_primitive();
         let tensor = match primitive {
-            TensorPrimitive::Float(t) => t.tensor.to_device((*adevice).into()).to_dtype(tch::Kind::Float, false, false),
+            TensorPrimitive::Float(t) => {
+                // Force dtype conversion (true, true) to ensure ROCm actually converts bf16->f32
+                t.tensor.to_device((*adevice).into()).to_dtype(tch::Kind::Float, true, true)
+            }
             _ => panic!("unexpected dtype for latent_pred"),
         };
         let latent_pred = Tensor::from_primitive(TensorPrimitive::Float(
@@ -739,7 +742,8 @@ impl VoxCPM<backend::LibTorch<bf16>> {
         let primitive = latent_pred.into_primitive();
         let tensor = match primitive {
             TensorPrimitive::Float(t) => {
-                t.tensor.to_device((*adevice).into()).to_dtype(tch::Kind::Float, false, false)
+                // Force dtype conversion (true, true) to ensure ROCm actually converts bf16->f32
+                t.tensor.to_device((*adevice).into()).to_dtype(tch::Kind::Float, true, true)
             }
             _ => panic!("unexpected dtype for latent_pred"),
         };

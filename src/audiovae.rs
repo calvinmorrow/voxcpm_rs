@@ -91,6 +91,8 @@ impl<B: Backend> AudioVae<B> {
         audio_date.pad((right_pad, 0, 0, 0), PadMode::Constant(0.0))
     }
     pub fn decode(&self, z: Tensor<B, 3>) -> Tensor<B, 3> {
+        // Defensive: ensure input is f32 to avoid bf16/f32 mismatch on ROCm
+        let z = z.cast(burn::tensor::DType::F32);
         self.decoder.forward(z)
     }
 
