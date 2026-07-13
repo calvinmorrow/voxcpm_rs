@@ -25,6 +25,7 @@ use kdam::tqdm;
 use tokenizers::Tokenizer;
 
 use crate::{
+    audio_vae_v2::AudioVAEV2,
     audiovae::{AudioVae, AudioVaeConfig},
     minicpm4::{MiniCPMConfig, MiniCPMModel},
 };
@@ -61,6 +62,8 @@ pub struct VoxCPMConfig {
     pub ref_audio_start_token: usize,
     #[config(default = 104)]
     pub ref_audio_end_token: usize,
+    pub architecture: Option<String>,
+    pub out_sample_rate: Option<usize>,
 }
 
 impl VoxCPMConfig {
@@ -431,16 +434,235 @@ impl<B: Backend> VoxCPM<B> {
         }
     }
 
+    // --- V2 AudioVAE variants (VoxCPM2) ---
+
+    pub fn build_prompt_features_v2<AB: Backend>(
+        &self,
+        prompt_text: String,
+        mut prompt_audio: Tensor<AB, 2>,
+        audio_vae: &AudioVAEV2<AB>,
+        device: &B::Device,
+    ) -> PromptFeatures<B> {
+        let patch_len = self.patch_size * audio_vae.chunk_size;
+        let pad_size = prompt_audio.dims()[1] % patch_len;
+        if pad_size != 0 {
+            prompt_audio = Tensor::pad(
+                prompt_audio,
+                (0, patch_len - pad_size, 0, 0),
+                PadMode::Constant(0.0),
+            );
+        }
+
+        let audio_feat = audio_vae.encode(prompt_audio.unsqueeze(), Some(audio_vae.sample_rate));
+
+        let audio_feat = audio_feat
+            .reshape([audio_vae.latent_dim as i64, -1, self.patch_size as i64])
+            .permute([1, 2, 0]);
+
+        let audio_feat = audio_feat.slice([s![..-1], s![..], s![..]]);
+        let audio_feat = Tensor::<B, 3>::from_data(
+            audio_feat
+                .to_data()
+                .convert_dtype(float_dtype_for_backend::<B>()),
+            device,
+        );
+        let audio_length = audio_feat.dims()[0];
+
+        PromptFeatures {
+            prompt_text,
+            audio_feat,
+            audio_length,
+        }
+    }
+
+    fn generate_latent_v2<AB: Backend>(
+        &mut self,
+        target_text: &str,
+        prompt: Option<(String, Tensor<AB, 2>)>,
+        tokenizer_path: &Path,
+        min_len: Option<usize>,
+        max_len: Option<usize>,
+        inference_timesteps: Option<usize>,
+        cfg_value: Option<f32>,
+        retry_badcase: bool,
+        retry_badcase_max_times: usize,
+        retry_badcase_ratio_threshold: f32,
+        _debug: bool,
+        _stop_on_zero: bool,
+        audio_vae: &AudioVAEV2<AB>,
+        device: &B::Device,
+        _adevice: &AB::Device,
+    ) -> Tensor<B, 3> {
+        self.generate_latent_with_prompt_features_v2(
+            target_text,
+            prompt.as_ref().map(|(text, audio)| {
+                self.build_prompt_features_v2(text.clone(), audio.clone(), audio_vae, device)
+            }),
+            tokenizer_path,
+            min_len,
+            max_len,
+            inference_timesteps,
+            cfg_value,
+            retry_badcase,
+            retry_badcase_max_times,
+            retry_badcase_ratio_threshold,
+            _debug,
+            _stop_on_zero,
+            audio_vae,
+            device,
+            _adevice,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn generate_latent_with_prompt_features_v2<AB: Backend>(
+        &mut self,
+        target_text: &str,
+        prompt_features: Option<PromptFeatures<B>>,
+        tokenizer_path: &Path,
+        min_len: Option<usize>,
+        max_len: Option<usize>,
+        inference_timesteps: Option<usize>,
+        cfg_value: Option<f32>,
+        retry_badcase: bool,
+        retry_badcase_max_times: usize,
+        retry_badcase_ratio_threshold: f32,
+        _debug: bool,
+        _stop_on_zero: bool,
+        audio_vae: &AudioVAEV2<AB>,
+        device: &B::Device,
+        _adevice: &AB::Device,
+    ) -> Tensor<B, 3> {
+        let tokenizer = Tokenizer::from_file(tokenizer_path).unwrap();
+        let text_token_in;
+        let text_mask_in;
+        let audio_feat_in;
+        let audio_mask_in;
+        let target_text_length;
+        if let Some(prompt_features) = prompt_features {
+            let text = prompt_features.prompt_text + target_text;
+            let text_token_ids = tokenize_masked(&tokenizer, &text);
+            let text_token_ids: Vec<usize> =
+                text_token_ids.into_iter().map(|id| id as usize).collect();
+            let text_token: Tensor<B, 1, Int> =
+                Tensor::from_data(text_token_ids.as_slice(), device);
+            let text_token = Tensor::cat(
+                vec![
+                    text_token,
+                    Tensor::from_data([self.audio_start_token], device),
+                ],
+                0,
+            );
+            let text_length = text_token.dims()[0];
+            let audio_length = prompt_features.audio_length;
+            let text_pad_token: Tensor<B, 1, Int> = Tensor::zeros([audio_length], device);
+
+            let text_token = Tensor::cat(vec![text_token, text_pad_token], 0);
+
+            let audio_pad_feat =
+                Tensor::zeros([text_length, self.patch_size, audio_vae.latent_dim], device);
+
+            let audio_feat = Tensor::cat(vec![audio_pad_feat, prompt_features.audio_feat], 0);
+
+            let text_mask = Tensor::cat(
+                vec![
+                    Tensor::<B, 1, Int>::ones([text_length], device),
+                    Tensor::<B, 1, Int>::zeros([audio_length], device),
+                ],
+                0,
+            );
+
+            let audio_mask = Tensor::cat(
+                vec![
+                    Tensor::<B, 1, Int>::zeros([text_length], device),
+                    Tensor::<B, 1, Int>::ones([audio_length], device),
+                ],
+                0,
+            );
+
+            text_token_in = text_token;
+            text_mask_in = text_mask;
+            audio_feat_in = audio_feat;
+            audio_mask_in = audio_mask;
+        } else {
+            let text = target_text;
+            let text_token_ids = tokenize_masked(&tokenizer, text);
+            let text_token_ids: Vec<usize> =
+                text_token_ids.into_iter().map(|id| id as usize).collect();
+            let text_token: Tensor<B, 1, Int> =
+                Tensor::from_data(text_token_ids.as_slice(), device);
+            let text_token = Tensor::cat(
+                vec![
+                    text_token,
+                    Tensor::from_data([self.audio_start_token], device),
+                ],
+                0,
+            );
+
+            let text_length = text_token.dims()[0];
+
+            let audio_feat: Tensor<B, 3> =
+                Tensor::zeros([text_length, self.patch_size, audio_vae.latent_dim], device);
+            let text_mask: Tensor<B, 1, Int> = Tensor::<B, 1, Int>::ones([text_length], device);
+            let audio_mask: Tensor<B, 1, Int> = Tensor::<B, 1, Int>::zeros([text_length], device);
+
+            text_token_in = text_token;
+            text_mask_in = text_mask;
+            audio_feat_in = audio_feat;
+            audio_mask_in = audio_mask;
+        }
+
+        target_text_length = tokenize_masked(&tokenizer, target_text).len();
+        let text_token = text_token_in.unsqueeze_dim(0);
+        let text_mask = text_mask_in.unsqueeze();
+        let audio_feat = audio_feat_in.unsqueeze_dim(0);
+        let audio_mask = audio_mask_in.unsqueeze();
+
+        let max_len = max_len.unwrap_or(2000);
+        let max_len =
+            ((target_text_length as f32 * retry_badcase_ratio_threshold).round() as usize + 10)
+                .min(max_len);
+        let mut retry_times = 0usize;
+        loop {
+            let (latent_pred, pred_audio_feat) = self.forward(
+                text_token.clone(),
+                text_mask.clone(),
+                audio_feat.clone(),
+                audio_mask.clone(),
+                min_len,
+                Some(max_len),
+                inference_timesteps,
+                cfg_value,
+                false,
+                false,
+            );
+            let pred_audio_feat_len = pred_audio_feat.dims()[0];
+            let ratio = pred_audio_feat_len as f32 / target_text_length as f32;
+            if pred_audio_feat_len as f32
+                >= target_text_length as f32 * retry_badcase_ratio_threshold
+            {
+                println!("Badcase detected, audio_text_ratio={}", ratio);
+            }
+            if retry_badcase && retry_times < retry_badcase_max_times {
+                if ratio >= retry_badcase_ratio_threshold {
+                    retry_times += 1;
+                    continue;
+                }
+            }
+            break latent_pred;
+        }
+    }
+
     pub fn forward(
         &mut self,
-        text: Tensor<B, 2, Int>,            //Tensor<B, 2>
-        text_mask: Tensor<B, 2, Int>,       //Tensor<B, 2>
-        feat: Tensor<B, 4>,                 //Tensor<B, 4>
-        feat_mask: Tensor<B, 2, Int>,       //Tensor<B, 2>
-        min_len: Option<usize>,             //2
-        max_len: Option<usize>,             //172
-        inference_timesteps: Option<usize>, //10
-        cfg_value: Option<f32>,             //1
+        text: Tensor<B, 2, Int>,
+        text_mask: Tensor<B, 2, Int>,
+        feat: Tensor<B, 4>,
+        feat_mask: Tensor<B, 2, Int>,
+        min_len: Option<usize>,
+        max_len: Option<usize>,
+        inference_timesteps: Option<usize>,
+        cfg_value: Option<f32>,
         _debug: bool,
         _stop_on_zero: bool,
     ) -> (Tensor<B, 3>, Tensor<B, 3>) {
@@ -680,7 +902,9 @@ impl VoxCPM<backend::LibTorch<bf16>> {
         let tensor = match primitive {
             TensorPrimitive::Float(t) => {
                 // Force dtype conversion (true, true) to ensure ROCm actually converts bf16->f32
-                t.tensor.to_device((*adevice).into()).to_dtype(tch::Kind::Float, true, true)
+                t.tensor
+                    .to_device((*adevice).into())
+                    .to_dtype(tch::Kind::Float, true, true)
             }
             _ => panic!("unexpected dtype for latent_pred"),
         };
@@ -743,7 +967,9 @@ impl VoxCPM<backend::LibTorch<bf16>> {
         let tensor = match primitive {
             TensorPrimitive::Float(t) => {
                 // Force dtype conversion (true, true) to ensure ROCm actually converts bf16->f32
-                t.tensor.to_device((*adevice).into()).to_dtype(tch::Kind::Float, true, true)
+                t.tensor
+                    .to_device((*adevice).into())
+                    .to_dtype(tch::Kind::Float, true, true)
             }
             _ => panic!("unexpected dtype for latent_pred"),
         };
@@ -754,6 +980,132 @@ impl VoxCPM<backend::LibTorch<bf16>> {
         let t_decode_start = Instant::now();
         log_device_check_once(&latent_pred, audio_vae);
         let decode_audio = audio_vae.decode(latent_pred).squeeze_dim::<2>(0);
+        let t_decode = t_decode_start.elapsed();
+        println!(
+            "Timing: latent_gen={:.3}s decode={:.3}s",
+            t_latent.as_secs_f64(),
+            t_decode.as_secs_f64()
+        );
+        decode_audio.slice([s![..], s![640..-640]]).squeeze()
+    }
+
+    pub fn generate_libtorch_v2(
+        &mut self,
+        target_text: &str,
+        prompt: Option<(String, Tensor<backend::LibTorch<f32>, 2>)>,
+        tokenizer_path: &Path,
+        min_len: Option<usize>,
+        max_len: Option<usize>,
+        inference_timesteps: Option<usize>,
+        cfg_value: Option<f32>,
+        retry_badcase: bool,
+        retry_badcase_max_times: usize,
+        retry_badcase_ratio_threshold: f32,
+        _debug: bool,
+        _stop_on_zero: bool,
+        audio_vae: &AudioVAEV2<backend::LibTorch<f32>>,
+        device: &<backend::LibTorch<bf16> as BackendTypes>::Device,
+        adevice: &<backend::LibTorch<f32> as BackendTypes>::Device,
+    ) -> Tensor<backend::LibTorch<f32>, 1> {
+        let t_start = Instant::now();
+        let latent_pred = self.generate_latent_v2(
+            target_text,
+            prompt,
+            tokenizer_path,
+            min_len,
+            max_len,
+            inference_timesteps,
+            cfg_value,
+            retry_badcase,
+            retry_badcase_max_times,
+            retry_badcase_ratio_threshold,
+            _debug,
+            _stop_on_zero,
+            audio_vae,
+            device,
+            adevice,
+        );
+        let t_latent = t_start.elapsed();
+
+        let primitive = latent_pred.into_primitive();
+        let tensor = match primitive {
+            TensorPrimitive::Float(t) => {
+                t.tensor
+                    .to_device((*adevice).into())
+                    .to_dtype(tch::Kind::Float, true, true)
+            }
+            _ => panic!("unexpected dtype for latent_pred"),
+        };
+        let latent_pred = Tensor::from_primitive(TensorPrimitive::Float(
+            burn::backend::libtorch::TchTensor::new(tensor),
+        ));
+
+        let t_decode_start = Instant::now();
+        log_device_check_once_v2(&latent_pred, audio_vae);
+        let decode_audio = audio_vae.decode(latent_pred, None).squeeze_dim::<2>(0);
+        let t_decode = t_decode_start.elapsed();
+        println!(
+            "Timing: latent_gen={:.3}s decode={:.3}s",
+            t_latent.as_secs_f64(),
+            t_decode.as_secs_f64()
+        );
+        decode_audio.slice([s![..], s![640..-640]]).squeeze()
+    }
+
+    pub fn generate_libtorch_with_prompt_features_v2(
+        &mut self,
+        target_text: &str,
+        prompt_features: Option<&PromptFeatures<backend::LibTorch<bf16>>>,
+        tokenizer_path: &Path,
+        min_len: Option<usize>,
+        max_len: Option<usize>,
+        inference_timesteps: Option<usize>,
+        cfg_value: Option<f32>,
+        retry_badcase: bool,
+        retry_badcase_max_times: usize,
+        retry_badcase_ratio_threshold: f32,
+        _debug: bool,
+        _stop_on_zero: bool,
+        audio_vae: &AudioVAEV2<backend::LibTorch<f32>>,
+        device: &<backend::LibTorch<bf16> as BackendTypes>::Device,
+        adevice: &<backend::LibTorch<f32> as BackendTypes>::Device,
+    ) -> Tensor<backend::LibTorch<f32>, 1> {
+        let t_start = Instant::now();
+        let latent_pred = self.generate_latent_with_prompt_features_v2(
+            target_text,
+            prompt_features.cloned(),
+            tokenizer_path,
+            min_len,
+            max_len,
+            inference_timesteps,
+            cfg_value,
+            retry_badcase,
+            retry_badcase_max_times,
+            retry_badcase_ratio_threshold,
+            _debug,
+            _stop_on_zero,
+            audio_vae,
+            device,
+            adevice,
+        );
+        let t_latent = t_start.elapsed();
+
+        let primitive = latent_pred.into_primitive();
+        let tensor = match primitive {
+            TensorPrimitive::Float(t) => {
+                t.tensor
+                    .to_device((*adevice).into())
+                    .to_dtype(tch::Kind::Float, true, true)
+            }
+            _ => panic!("unexpected dtype for latent_pred"),
+        };
+        let latent_pred = Tensor::from_primitive(TensorPrimitive::Float(
+            burn::backend::libtorch::TchTensor::new(tensor),
+        ));
+
+        let t_decode_start = Instant::now();
+        log_device_check_once_v2(&latent_pred, audio_vae);
+        let decode_audio = audio_vae.decode(latent_pred, None).squeeze_dim::<2>(0);
         let t_decode = t_decode_start.elapsed();
         println!(
             "Timing: latent_gen={:.3}s decode={:.3}s",
@@ -806,7 +1158,11 @@ impl VoxCPM<backend::LibTorch<f16>> {
         // Cast f16 latent to f32 and move to audio device on GPU to avoid CPU round-trips.
         let primitive = latent_pred.into_primitive();
         let tensor = match primitive {
-            TensorPrimitive::Float(t) => t.tensor.to_device((*adevice).into()).to_dtype(tch::Kind::Float, false, false),
+            TensorPrimitive::Float(t) => {
+                t.tensor
+                    .to_device((*adevice).into())
+                    .to_dtype(tch::Kind::Float, false, false)
+            }
             _ => panic!("unexpected dtype for latent_pred"),
         };
         let latent_pred = Tensor::from_primitive(TensorPrimitive::Float(
@@ -866,7 +1222,11 @@ impl VoxCPM<backend::LibTorch<f16>> {
         // Cast f16 latent to f32 and move to audio device on GPU to avoid CPU round-trips.
         let primitive = latent_pred.into_primitive();
         let tensor = match primitive {
-            TensorPrimitive::Float(t) => t.tensor.to_device((*adevice).into()).to_dtype(tch::Kind::Float, false, false),
+            TensorPrimitive::Float(t) => {
+                t.tensor
+                    .to_device((*adevice).into())
+                    .to_dtype(tch::Kind::Float, false, false)
+            }
             _ => panic!("unexpected dtype for latent_pred"),
         };
         let latent_pred = Tensor::from_primitive(TensorPrimitive::Float(
@@ -876,6 +1236,132 @@ impl VoxCPM<backend::LibTorch<f16>> {
         let t_decode_start = Instant::now();
         log_device_check_once(&latent_pred, audio_vae);
         let decode_audio = audio_vae.decode(latent_pred).squeeze_dim::<2>(0);
+        let t_decode = t_decode_start.elapsed();
+        println!(
+            "Timing: latent_gen={:.3}s decode={:.3}s",
+            t_latent.as_secs_f64(),
+            t_decode.as_secs_f64()
+        );
+        decode_audio.slice([s![..], s![640..-640]]).squeeze()
+    }
+
+    pub fn generate_libtorch_v2(
+        &mut self,
+        target_text: &str,
+        prompt: Option<(String, Tensor<backend::LibTorch<f32>, 2>)>,
+        tokenizer_path: &Path,
+        min_len: Option<usize>,
+        max_len: Option<usize>,
+        inference_timesteps: Option<usize>,
+        cfg_value: Option<f32>,
+        retry_badcase: bool,
+        retry_badcase_max_times: usize,
+        retry_badcase_ratio_threshold: f32,
+        _debug: bool,
+        _stop_on_zero: bool,
+        audio_vae: &AudioVAEV2<backend::LibTorch<f32>>,
+        device: &<backend::LibTorch<f16> as BackendTypes>::Device,
+        adevice: &<backend::LibTorch<f32> as BackendTypes>::Device,
+    ) -> Tensor<backend::LibTorch<f32>, 1> {
+        let t_start = Instant::now();
+        let latent_pred = self.generate_latent_v2(
+            target_text,
+            prompt,
+            tokenizer_path,
+            min_len,
+            max_len,
+            inference_timesteps,
+            cfg_value,
+            retry_badcase,
+            retry_badcase_max_times,
+            retry_badcase_ratio_threshold,
+            _debug,
+            _stop_on_zero,
+            audio_vae,
+            device,
+            adevice,
+        );
+        let t_latent = t_start.elapsed();
+
+        let primitive = latent_pred.into_primitive();
+        let tensor = match primitive {
+            TensorPrimitive::Float(t) => {
+                t.tensor
+                    .to_device((*adevice).into())
+                    .to_dtype(tch::Kind::Float, false, false)
+            }
+            _ => panic!("unexpected dtype for latent_pred"),
+        };
+        let latent_pred = Tensor::from_primitive(TensorPrimitive::Float(
+            burn::backend::libtorch::TchTensor::new(tensor),
+        ));
+
+        let t_decode_start = Instant::now();
+        log_device_check_once_v2(&latent_pred, audio_vae);
+        let decode_audio = audio_vae.decode(latent_pred, None).squeeze_dim::<2>(0);
+        let t_decode = t_decode_start.elapsed();
+        println!(
+            "Timing: latent_gen={:.3}s decode={:.3}s",
+            t_latent.as_secs_f64(),
+            t_decode.as_secs_f64()
+        );
+        decode_audio.slice([s![..], s![640..-640]]).squeeze()
+    }
+
+    pub fn generate_libtorch_with_prompt_features_v2(
+        &mut self,
+        target_text: &str,
+        prompt_features: Option<&PromptFeatures<backend::LibTorch<f16>>>,
+        tokenizer_path: &Path,
+        min_len: Option<usize>,
+        max_len: Option<usize>,
+        inference_timesteps: Option<usize>,
+        cfg_value: Option<f32>,
+        retry_badcase: bool,
+        retry_badcase_max_times: usize,
+        retry_badcase_ratio_threshold: f32,
+        _debug: bool,
+        _stop_on_zero: bool,
+        audio_vae: &AudioVAEV2<backend::LibTorch<f32>>,
+        device: &<backend::LibTorch<f16> as BackendTypes>::Device,
+        adevice: &<backend::LibTorch<f32> as BackendTypes>::Device,
+    ) -> Tensor<backend::LibTorch<f32>, 1> {
+        let t_start = Instant::now();
+        let latent_pred = self.generate_latent_with_prompt_features_v2(
+            target_text,
+            prompt_features.cloned(),
+            tokenizer_path,
+            min_len,
+            max_len,
+            inference_timesteps,
+            cfg_value,
+            retry_badcase,
+            retry_badcase_max_times,
+            retry_badcase_ratio_threshold,
+            _debug,
+            _stop_on_zero,
+            audio_vae,
+            device,
+            adevice,
+        );
+        let t_latent = t_start.elapsed();
+
+        let primitive = latent_pred.into_primitive();
+        let tensor = match primitive {
+            TensorPrimitive::Float(t) => {
+                t.tensor
+                    .to_device((*adevice).into())
+                    .to_dtype(tch::Kind::Float, false, false)
+            }
+            _ => panic!("unexpected dtype for latent_pred"),
+        };
+        let latent_pred = Tensor::from_primitive(TensorPrimitive::Float(
+            burn::backend::libtorch::TchTensor::new(tensor),
+        ));
+
+        let t_decode_start = Instant::now();
+        log_device_check_once_v2(&latent_pred, audio_vae);
+        let decode_audio = audio_vae.decode(latent_pred, None).squeeze_dim::<2>(0);
         let t_decode = t_decode_start.elapsed();
         println!(
             "Timing: latent_gen={:.3}s decode={:.3}s",
@@ -905,6 +1391,19 @@ fn layer_timing_mode() -> Option<&'static str> {
 fn log_device_check_once(
     latent_pred: &Tensor<backend::LibTorch<f32>, 3>,
     audio_vae: &AudioVae<backend::LibTorch<f32>>,
+) {
+    static LOGGED: OnceLock<()> = OnceLock::new();
+    if LOGGED.get().is_some() {
+        return;
+    }
+    let _ = LOGGED.set(());
+    println!("Device check: latent_pred={:?}", latent_pred.device());
+    println!("Device check: audio_vae={:?}", audio_vae.device());
+}
+
+fn log_device_check_once_v2(
+    latent_pred: &Tensor<backend::LibTorch<f32>, 3>,
+    audio_vae: &AudioVAEV2<backend::LibTorch<f32>>,
 ) {
     static LOGGED: OnceLock<()> = OnceLock::new();
     if LOGGED.get().is_some() {

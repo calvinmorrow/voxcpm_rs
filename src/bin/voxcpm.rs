@@ -9,7 +9,9 @@ use burn_store::{BurnpackStore, ModuleSnapshot};
 use burn::tensor::{PrintOptions, set_print_options};
 use clap::Parser;
 use hound::{Sample, SampleFormat, WavReader, WavSpec};
+use serde_json::Value;
 use tch::Cuda;
+use voxcpm_rs::audio_vae_v2::{AudioVAEV2, AudioVaeConfigV2};
 use voxcpm_rs::audiovae::AudioVae;
 use voxcpm_rs::voxcpm::{VoxCPM, VoxCPMConfig};
 
@@ -89,11 +91,12 @@ fn run_bf16(
     tts.load_from(&mut store)
         .expect("couldn't load tts model from burnpack");
 
-    let mut audio_vae: AudioVae<BAud> = tts_config.audio_vae_config.init(audio_device);
-    let mut store = BurnpackStore::from_file(model_path.join("audiovae.bpk"));
-    audio_vae
-        .load_from(&mut store)
-        .expect("couldn't load audio_vae model from burnpack");
+    let is_voxcpm2 = tts_config.architecture.as_deref() == Some("voxcpm2");
+    let output_sample_rate = if is_voxcpm2 {
+        tts_config.out_sample_rate.unwrap_or(48000) as u32
+    } else {
+        tts_config.audio_vae_config.sample_rate as u32
+    };
 
     let prompt = match (&args.prompt_text, &args.prompt_wav_path) {
         (Some(prompt_text), Some(prompt_wav_path)) => Some((
@@ -105,26 +108,88 @@ fn run_bf16(
         _ => panic!("provide none or both prompt text and prompt audio"),
     };
 
+    // For VoxCPM2, re-deserialize audio_vae_config as V2 type from raw JSON
+    let v2_audio_vae_config = if is_voxcpm2 {
+        let raw = std::fs::read_to_string(model_path.join("config.json"))
+            .expect("couldn't read config.json");
+        let json: Value = serde_json::from_str(&raw).expect("invalid config.json");
+        let vae_obj = match json["audio_vae_config"].as_object() {
+            Some(obj) => {
+                let mut map = obj.clone();
+                // Fill defaults for fields missing from some config.json files
+                map.entry("out_sample_rate")
+                    .or_insert_with(|| Value::Number(48000.into()));
+                map.entry("cond_type")
+                    .or_insert_with(|| Value::String("scale_bias".into()));
+                map.entry("cond_dim")
+                    .or_insert_with(|| Value::Number(128.into()));
+                map.entry("cond_out_layer")
+                    .or_insert_with(|| Value::Bool(false));
+                Value::Object(map)
+            }
+            None => Value::Object(serde_json::Map::new()),
+        };
+        let v2_config: AudioVaeConfigV2 =
+            serde_json::from_value(vae_obj).expect("couldn't deserialize audio_vae_config as V2");
+        Some(v2_config)
+    } else {
+        None
+    };
+
     let t_gen_start = Instant::now();
-    let wav = tts.generate_libtorch(
-        args.target_text
-            .as_deref()
-            .unwrap_or("VoxCPM Tokenizer Free TTS for Context Aware Speech Generation and True to Life Voice Cloning"),
-        prompt,
-        &model_path.join("tokenizer.json"),
-        args.min_len,
-        args.max_len,
-        args.inference_timesteps,
-        args.cfg_value,
-        args.retry_badcase.unwrap_or(false),
-        args.retry_badcase_max_times.unwrap_or(3),
-        args.retry_badcase_ratio_threshold.unwrap_or(6.0),
-        false,
-        false,
-        &audio_vae,
-        tts_device,
-        audio_device,
-    );
+    let wav = if is_voxcpm2 {
+        let mut audio_vae_v2: AudioVAEV2<BAud> = v2_audio_vae_config.unwrap().init(audio_device);
+        let mut store = BurnpackStore::from_file(model_path.join("audiovae.bpk"));
+        audio_vae_v2
+            .load_from(&mut store)
+            .expect("couldn't load audio_vae model from burnpack");
+
+        tts.generate_libtorch_v2(
+            args.target_text
+                .as_deref()
+                .unwrap_or("VoxCPM Tokenizer Free TTS for Context Aware Speech Generation and True to Life Voice Cloning"),
+            prompt,
+            &model_path.join("tokenizer.json"),
+            args.min_len,
+            args.max_len,
+            args.inference_timesteps,
+            args.cfg_value,
+            args.retry_badcase.unwrap_or(false),
+            args.retry_badcase_max_times.unwrap_or(3),
+            args.retry_badcase_ratio_threshold.unwrap_or(6.0),
+            false,
+            false,
+            &audio_vae_v2,
+            tts_device,
+            audio_device,
+        )
+    } else {
+        let mut audio_vae: AudioVae<BAud> = tts_config.audio_vae_config.init(audio_device);
+        let mut store = BurnpackStore::from_file(model_path.join("audiovae.bpk"));
+        audio_vae
+            .load_from(&mut store)
+            .expect("couldn't load audio_vae model from burnpack");
+
+        tts.generate_libtorch(
+            args.target_text
+                .as_deref()
+                .unwrap_or("VoxCPM Tokenizer Free TTS for Context Aware Speech Generation and True to Life Voice Cloning"),
+            prompt,
+            &model_path.join("tokenizer.json"),
+            args.min_len,
+            args.max_len,
+            args.inference_timesteps,
+            args.cfg_value,
+            args.retry_badcase.unwrap_or(false),
+            args.retry_badcase_max_times.unwrap_or(3),
+            args.retry_badcase_ratio_threshold.unwrap_or(6.0),
+            false,
+            false,
+            &audio_vae,
+            tts_device,
+            audio_device,
+        )
+    };
     let t_gen = t_gen_start.elapsed();
 
     let t_convert_start = Instant::now();
@@ -133,7 +198,7 @@ fn run_bf16(
 
     let spec = hound::WavSpec {
         channels: 1,
-        sample_rate: audio_vae.sample_rate as u32,
+        sample_rate: output_sample_rate,
         bits_per_sample: 16,
         sample_format: hound::SampleFormat::Int,
     };
@@ -169,11 +234,12 @@ fn run_f16(
     tts.load_from(&mut store)
         .expect("couldn't load tts model from burnpack");
 
-    let mut audio_vae: AudioVae<BAud> = tts_config.audio_vae_config.init(audio_device);
-    let mut store = BurnpackStore::from_file(model_path.join("audiovae.bpk"));
-    audio_vae
-        .load_from(&mut store)
-        .expect("couldn't load audio_vae model from burnpack");
+    let is_voxcpm2 = tts_config.architecture.as_deref() == Some("voxcpm2");
+    let output_sample_rate = if is_voxcpm2 {
+        tts_config.out_sample_rate.unwrap_or(48000) as u32
+    } else {
+        tts_config.audio_vae_config.sample_rate as u32
+    };
 
     let prompt = match (&args.prompt_text, &args.prompt_wav_path) {
         (Some(prompt_text), Some(prompt_wav_path)) => Some((
@@ -185,26 +251,74 @@ fn run_f16(
         _ => panic!("provide none or both prompt text and prompt audio"),
     };
 
+    // For VoxCPM2, re-deserialize audio_vae_config as V2 type from raw JSON
+    let v2_audio_vae_config = if is_voxcpm2 {
+        let raw = std::fs::read_to_string(model_path.join("config.json"))
+            .expect("couldn't read config.json");
+        let json: Value = serde_json::from_str(&raw).expect("invalid config.json");
+        let vae_json = json["audio_vae_config"].clone();
+        Some(
+            serde_json::from_value::<AudioVaeConfigV2>(vae_json)
+                .expect("couldn't deserialize audio_vae_config as V2"),
+        )
+    } else {
+        None
+    };
+
     let t_gen_start = Instant::now();
-    let wav = tts.generate_libtorch(
-        args.target_text
-            .as_deref()
-            .unwrap_or("VoxCPM Tokenizer Free TTS for Context Aware Speech Generation and True to Life Voice Cloning"),
-        prompt,
-        &model_path.join("tokenizer.json"),
-        args.min_len,
-        args.max_len,
-        args.inference_timesteps,
-        args.cfg_value,
-        args.retry_badcase.unwrap_or(false),
-        args.retry_badcase_max_times.unwrap_or(3),
-        args.retry_badcase_ratio_threshold.unwrap_or(6.0),
-        false,
-        false,
-        &audio_vae,
-        tts_device,
-        audio_device,
-    );
+    let wav = if is_voxcpm2 {
+        let mut audio_vae_v2: AudioVAEV2<BAud> = v2_audio_vae_config.unwrap().init(audio_device);
+        let mut store = BurnpackStore::from_file(model_path.join("audiovae.bpk"));
+        audio_vae_v2
+            .load_from(&mut store)
+            .expect("couldn't load audio_vae model from burnpack");
+
+        tts.generate_libtorch_v2(
+            args.target_text
+                .as_deref()
+                .unwrap_or("VoxCPM Tokenizer Free TTS for Context Aware Speech Generation and True to Life Voice Cloning"),
+            prompt,
+            &model_path.join("tokenizer.json"),
+            args.min_len,
+            args.max_len,
+            args.inference_timesteps,
+            args.cfg_value,
+            args.retry_badcase.unwrap_or(false),
+            args.retry_badcase_max_times.unwrap_or(3),
+            args.retry_badcase_ratio_threshold.unwrap_or(6.0),
+            false,
+            false,
+            &audio_vae_v2,
+            tts_device,
+            audio_device,
+        )
+    } else {
+        let mut audio_vae: AudioVae<BAud> = tts_config.audio_vae_config.init(audio_device);
+        let mut store = BurnpackStore::from_file(model_path.join("audiovae.bpk"));
+        audio_vae
+            .load_from(&mut store)
+            .expect("couldn't load audio_vae model from burnpack");
+
+        tts.generate_libtorch(
+            args.target_text
+                .as_deref()
+                .unwrap_or("VoxCPM Tokenizer Free TTS for Context Aware Speech Generation and True to Life Voice Cloning"),
+            prompt,
+            &model_path.join("tokenizer.json"),
+            args.min_len,
+            args.max_len,
+            args.inference_timesteps,
+            args.cfg_value,
+            args.retry_badcase.unwrap_or(false),
+            args.retry_badcase_max_times.unwrap_or(3),
+            args.retry_badcase_ratio_threshold.unwrap_or(6.0),
+            false,
+            false,
+            &audio_vae,
+            tts_device,
+            audio_device,
+        )
+    };
     let t_gen = t_gen_start.elapsed();
 
     let t_convert_start = Instant::now();
@@ -213,7 +327,7 @@ fn run_f16(
 
     let spec = hound::WavSpec {
         channels: 1,
-        sample_rate: audio_vae.sample_rate as u32,
+        sample_rate: output_sample_rate,
         bits_per_sample: 16,
         sample_format: hound::SampleFormat::Int,
     };

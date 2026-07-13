@@ -5,7 +5,7 @@ use burn::{
     nn::Tanh,
     prelude::Backend,
     tensor::{
-        Distribution,
+        DType, Distribution,
         module::{conv_transpose1d, conv1d},
         ops::{ConvOptions, ConvTransposeOptions, PadMode},
         s,
@@ -37,6 +37,7 @@ pub struct AudioVaeConfigV2 {
     out_sample_rate: usize,
     #[config(default = false)]
     use_noise_block: bool,
+    #[config(default = "Some(vec![20000, 30000, 40000])")]
     sr_bin_boundaries: Option<Vec<i32>>,
     #[config(default = "\"scale_bias\".to_string()")]
     cond_type: String,
@@ -127,6 +128,8 @@ impl<B: Backend> AudioVAEV2<B> {
     /// `sr_cond` is used when `sr_bin_boundaries` is configured; defaults to
     /// `out_sample_rate` when not provided.
     pub fn decode(&self, z: Tensor<B, 3>, sr_cond: Option<Tensor<B, 1>>) -> Tensor<B, 3> {
+        let z = self.decoder.pad_input_if_needed(z);
+        let z = z.cast(DType::F32);
         self.decoder.forward(z, sr_cond, self.out_sample_rate)
     }
 }
@@ -272,27 +275,25 @@ impl CausalDecoderV2Config {
         let sr_bin_buckets = boundaries.len() + 1;
 
         let mut model: Vec<CausalDecoderLayerV2<B>> = Vec::new();
-        let mut sr_cond_layers: Vec<Option<SampleRateConditionLayer<B>>> = Vec::new();
+        let mut sr_cond_layers: Vec<SampleRateConditionLayer<B>> = Vec::new();
 
         // Initial conv layers (no conditioning)
         let init_layers = self.build_init_layers(device);
         for layer in init_layers {
             model.push(CausalDecoderLayerV2::Plain(layer));
-            sr_cond_layers.push(None);
         }
 
         // Decoder blocks with conditioning
         let block_layers = self.build_block_layers(device, sr_bin_buckets);
         for (layer, cond) in block_layers {
             model.push(CausalDecoderLayerV2::Plain(layer));
-            sr_cond_layers.push(Some(cond));
+            sr_cond_layers.push(cond);
         }
 
         // Final layers (no conditioning)
         let final_layers = self.build_final_layers(device);
         for layer in final_layers {
             model.push(CausalDecoderLayerV2::Plain(layer));
-            sr_cond_layers.push(None);
         }
 
         CausalDecoderV2 {
@@ -447,10 +448,32 @@ impl<B: Backend> CausalDecoderLayerV2<B> {
 pub struct CausalDecoderV2<B: Backend> {
     model: Vec<CausalDecoderLayerV2<B>>,
     sr_bin_boundaries: Option<Vec<i32>>,
-    sr_cond_layers: Vec<Option<SampleRateConditionLayer<B>>>,
+    sr_cond_layers: Vec<SampleRateConditionLayer<B>>,
 }
 
 impl<B: Backend> CausalDecoderV2<B> {
+    /// If the input has fewer channels than the first conv layer expects,
+    /// concatenate zero channels to match.
+    fn pad_input_if_needed(&self, mut x: Tensor<B, 3>) -> Tensor<B, 3> {
+        // Inspect the first conv layer to determine expected input channels
+        if let CausalDecoderLayerV2::Plain(CausalDecoderPlainLayerV2::WNCausalConv1d(conv)) =
+            &self.model[0]
+        {
+            let [expected, _, _] = conv.weight_v.val().dims();
+            let [_, actual, _] = x.dims();
+            if actual < expected {
+                let pad = expected - actual;
+                eprintln!(
+                    "Decoder input padding: {} -> {} channels (pad {} zero channels)",
+                    actual, expected, pad
+                );
+                let zeros = Tensor::zeros([x.dims()[0], pad, x.dims()[2]], &x.device());
+                x = Tensor::cat(vec![x, zeros], 1);
+            }
+        }
+        x
+    }
+
     pub fn forward(
         &self,
         mut x: Tensor<B, 3>,
@@ -462,9 +485,11 @@ impl<B: Backend> CausalDecoderV2<B> {
                 .unwrap_or_else(|| Tensor::ones(&vec![1], &x.device()) * (default_out_sr as f64));
             let sr_idx = self.bucketize_sr(sr_cond);
 
-            for (layer, cond_layer) in self.model.iter().zip(self.sr_cond_layers.iter()) {
-                if let Some(cond) = cond_layer {
-                    x = cond.forward(x, sr_idx.clone());
+            for (i, layer) in self.model.iter().enumerate() {
+                if let Some(cond_idx) = i.checked_sub(2) {
+                    if let Some(cond) = self.sr_cond_layers.get(cond_idx) {
+                        x = cond.forward(x, sr_idx.clone());
+                    }
                 }
                 x = layer.forward(x);
             }
@@ -493,7 +518,7 @@ impl<B: Backend> CausalDecoderV2<B> {
             .int()
             .float()
             .sum_dims(&[1])
-            .squeeze();
+            .reshape([batch]);
 
         // Clamp to valid bucket range [0, buckets-1]
         let max_val = Tensor::ones(&vec![batch], &device) * buckets;
@@ -526,7 +551,7 @@ pub struct CausalDecoderBlockV2Config {
 
 impl CausalDecoderBlockV2Config {
     pub fn init<B: Backend>(&self, device: &B::Device) -> CausalDecoderBlockV2<B> {
-        let causal_pad = self.stride / 2;
+        let causal_pad = self.stride.div_ceil(2);
         let causal_out_pad = self.stride % 2;
         let causal_trim = causal_pad * 2 - causal_out_pad;
 
@@ -827,20 +852,18 @@ impl<B: Backend> WNCausalConv1dV2<B> {
         let weight_v = self.weight_v.val().cast(dtype);
         let weight_g = self.weight_g.val().cast(dtype);
 
-        let v = weight_v.clone()
-            / weight_v
-                .powf_scalar(2.0)
-                .sum_dims(&[2, 1])
-                .sqrt();
+        let v = weight_v.clone() / weight_v.powf_scalar(2.0).sum_dims(&[2, 1]).sqrt();
         let w = weight_g * v;
 
-        // Causal: left-pad only (V2 semantics)
+        // Causal: left-pad only (V2 semantics). In mixed bf16/f32 LibTorch runs,
+        // Burn's pad can produce a tensor with the active TTS dtype, so restore
+        // the original AudioVAE dtype before convolution.
         let x = if self.causal_padding > 0 {
-            x.pad((0, 0, self.causal_padding * 2, 0), PadMode::Constant(0.0))
+            x.pad((self.causal_padding * 2, 0, 0, 0), PadMode::Constant(0.0))
+                .cast(dtype)
         } else {
             x
         };
-
         conv1d(
             x.clone(),
             w,
@@ -904,11 +927,7 @@ impl<B: Backend> WNCausalTransposeConv1dV2<B> {
         let weight_v = self.weight_v.val().cast(dtype);
         let weight_g = self.weight_g.val().cast(dtype);
 
-        let v = weight_v.clone()
-            / weight_v
-                .powf_scalar(2.0)
-                .sum_dims(&[2, 1])
-                .sqrt();
+        let v = weight_v.clone() / weight_v.powf_scalar(2.0).sum_dims(&[2, 1]).sqrt();
         let w = weight_g * v;
 
         let out = conv_transpose1d(
@@ -1116,7 +1135,7 @@ pub struct SampleRateConditionLayer<B: Backend> {
 impl<B: Backend> SampleRateConditionLayer<B> {
     /// Embed lookup: select row from weight matrix by sr_idx.
     /// sr_idx: [B] -> result: [B, dim, 1]
-    fn embed_lookup(weight: &Tensor<B, 2>, sr_idx: &Tensor<B, 1>) -> Tensor<B, 3> {
+    fn embed_lookup(weight: &Tensor<B, 2>, sr_idx: &Tensor<B, 1>, dtype: DType) -> Tensor<B, 3> {
         let [num_buckets, dim] = weight.dims();
         let batch = sr_idx.dims()[0];
 
@@ -1129,28 +1148,33 @@ impl<B: Backend> SampleRateConditionLayer<B> {
             .reshape([batch, 1])
             .expand([batch, num_buckets]);
         let sr_int = sr_flat.int();
-        let one_hot = indices.equal(sr_int).int().float();
+        let one_hot = indices.equal(sr_int).int().float().cast(dtype);
 
         // [B, num_buckets] @ [num_buckets, dim] = [B, dim]
-        let selected = one_hot.matmul(weight.clone());
+        let selected = one_hot.matmul(weight.clone().cast(dtype));
         selected.reshape([batch, dim, 1])
     }
 
     pub fn forward(&self, x: Tensor<B, 3>, sr_idx: Tensor<B, 1>) -> Tensor<B, 3> {
         let [batch, _channels, time_steps] = x.dims();
+        let dtype = x.dtype();
 
         let mut result = match self.cond_type.as_str() {
             "scale_bias" | "scale_bias_init" => {
-                let scale = Self::embed_lookup(&self.scale_weight.as_ref().unwrap().val(), &sr_idx);
-                let bias = Self::embed_lookup(&self.bias_weight.as_ref().unwrap().val(), &sr_idx);
+                let scale =
+                    Self::embed_lookup(&self.scale_weight.as_ref().unwrap().val(), &sr_idx, dtype);
+                let bias =
+                    Self::embed_lookup(&self.bias_weight.as_ref().unwrap().val(), &sr_idx, dtype);
                 x * scale + bias
             }
             "add" => {
-                let cond = Self::embed_lookup(&self.cond_weight.as_ref().unwrap().val(), &sr_idx);
+                let cond =
+                    Self::embed_lookup(&self.cond_weight.as_ref().unwrap().val(), &sr_idx, dtype);
                 x + cond
             }
             "concat" => {
-                let cond = Self::embed_lookup(&self.cond_weight.as_ref().unwrap().val(), &sr_idx);
+                let cond =
+                    Self::embed_lookup(&self.cond_weight.as_ref().unwrap().val(), &sr_idx, dtype);
                 // Expand cond to [B, cond_dim, T]
                 let cond_expanded = cond.expand([
                     batch,

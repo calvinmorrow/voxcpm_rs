@@ -11,6 +11,7 @@ use burn_store::{
 use clap::Parser;
 use serde_json::Value;
 use tch::Cuda;
+use voxcpm_rs::audio_vae_v2::{AudioVAEV2, AudioVaeConfigV2};
 use voxcpm_rs::audiovae::AudioVae;
 use voxcpm_rs::voxcpm::{VoxCPM, VoxCPMConfig};
 
@@ -25,6 +26,8 @@ struct Args {
     tts_dtype: TtsDtype,
     #[arg(long)]
     device: Option<String>,
+    #[arg(long)]
+    audio_vae_only: bool,
 }
 
 type BAud = backend::LibTorch<f32>;
@@ -50,6 +53,7 @@ fn main() {
         &args.output_path,
         args.device.as_deref(),
         args.tts_dtype,
+        args.audio_vae_only,
     );
 }
 
@@ -132,6 +136,8 @@ fn preprocess_config(config_path: &Path) -> Result<Value, Box<dyn std::error::Er
         }
     }
 
+    let is_voxcpm2 = config["architecture"].as_str() == Some("voxcpm2");
+
     // Ensure audio_vae_config has required fields with defaults
     if let Some(aud) = config
         .get_mut("audio_vae_config")
@@ -143,12 +149,30 @@ fn preprocess_config(config_path: &Path) -> Result<Value, Box<dyn std::error::Er
         if !aud.contains_key("use_noise_block") {
             aud.insert("use_noise_block".to_string(), Value::Bool(false));
         }
-        // Strip V2-only fields that V1 AudioVaeConfig doesn't expect
-        aud.remove("sr_bin_boundaries");
-        aud.remove("out_sample_rate");
-        aud.remove("cond_type");
-        aud.remove("cond_dim");
-        aud.remove("cond_out_layer");
+        if is_voxcpm2 {
+            if !aud.contains_key("out_sample_rate") {
+                aud.insert("out_sample_rate".to_string(), Value::Number(48000.into()));
+            }
+            if !aud.contains_key("cond_type") {
+                aud.insert("cond_type".to_string(), Value::String("scale_bias".into()));
+            }
+            if !aud.contains_key("cond_dim") {
+                aud.insert("cond_dim".to_string(), Value::Number(128.into()));
+            }
+            if !aud.contains_key("cond_out_layer") {
+                aud.insert("cond_out_layer".to_string(), Value::Bool(false));
+            }
+        }
+        // Strip V2-only fields only for VoxCPM 1.x. VoxCPM2 uses the same
+        // config object to initialize AudioVAEV2, including sample-rate
+        // conditioning (`sr_bin_boundaries`).
+        if !is_voxcpm2 {
+            aud.remove("sr_bin_boundaries");
+            aud.remove("out_sample_rate");
+            aud.remove("cond_type");
+            aud.remove("cond_dim");
+            aud.remove("cond_out_layer");
+        }
     }
 
     Ok(config)
@@ -258,7 +282,13 @@ fn build_key_remappings(
     remaps
 }
 
-fn convert(input_path: &str, output_path: &str, device: Option<&str>, tts_dtype: TtsDtype) {
+fn convert(
+    input_path: &str,
+    output_path: &str,
+    device: Option<&str>,
+    tts_dtype: TtsDtype,
+    audio_vae_only: bool,
+) {
     let input_path = Path::new(input_path);
     let output_path = Path::new(output_path);
     if !output_path.exists() {
@@ -300,79 +330,130 @@ fn convert(input_path: &str, output_path: &str, device: Option<&str>, tts_dtype:
         key_remappings.len()
     );
 
-    match tts_dtype {
-        TtsDtype::Bf16 => {
-            type BTts = backend::LibTorch<bf16>;
-            let mut tts: VoxCPM<BTts> = tts_config.init(&tts_device);
-            let mut store = SafetensorsStore::from_file(input_path.join("model.safetensors"))
-                .with_from_adapter(PyTorchToBurnAdapter)
-                .map_indices_contiguous(true)
-                .skip_enum_variants(true);
-            for (from, to) in &key_remappings {
-                store = store.with_key_remapping(from, to);
+    if !audio_vae_only {
+        match tts_dtype {
+            TtsDtype::Bf16 => {
+                type BTts = backend::LibTorch<bf16>;
+                let mut tts: VoxCPM<BTts> = tts_config.init(&tts_device);
+                let mut store = SafetensorsStore::from_file(input_path.join("model.safetensors"))
+                    .with_from_adapter(PyTorchToBurnAdapter)
+                    .map_indices_contiguous(true)
+                    .skip_enum_variants(true);
+                for (from, to) in &key_remappings {
+                    store = store.with_key_remapping(from, to);
+                }
+                println!("Loading TTS model tensors...");
+                println!(
+                    "{:?}",
+                    tts.load_from(&mut store)
+                        .expect("couldn't load safetensors tts model")
+                );
+                let tts = cast_module_float_dtype(tts, DType::BF16);
+                let mut store =
+                    BurnpackStore::from_file(output_path.join("voxcpm.bpk")).overwrite(true);
+                println!(
+                    "{:?}",
+                    tts.save_into(&mut store)
+                        .expect("couldn't save tts model to burnpack")
+                );
             }
-            println!("Loading TTS model tensors...");
-            println!(
-                "{:?}",
-                tts.load_from(&mut store)
-                    .expect("couldn't load safetensors tts model")
-            );
-            let tts = cast_module_float_dtype(tts, DType::BF16);
-            let mut store =
-                BurnpackStore::from_file(output_path.join("voxcpm.bpk")).overwrite(true);
-            println!(
-                "{:?}",
-                tts.save_into(&mut store)
-                    .expect("couldn't save tts model to burnpack")
-            );
-        }
-        TtsDtype::F16 => {
-            type BTts = backend::LibTorch<f16>;
-            let mut tts: VoxCPM<BTts> = tts_config.init(&tts_device);
-            let mut store = SafetensorsStore::from_file(input_path.join("model.safetensors"))
-                .with_from_adapter(PyTorchToBurnAdapter)
-                .map_indices_contiguous(true)
-                .skip_enum_variants(true);
-            for (from, to) in &key_remappings {
-                store = store.with_key_remapping(from, to);
+            TtsDtype::F16 => {
+                type BTts = backend::LibTorch<f16>;
+                let mut tts: VoxCPM<BTts> = tts_config.init(&tts_device);
+                let mut store = SafetensorsStore::from_file(input_path.join("model.safetensors"))
+                    .with_from_adapter(PyTorchToBurnAdapter)
+                    .map_indices_contiguous(true)
+                    .skip_enum_variants(true);
+                for (from, to) in &key_remappings {
+                    store = store.with_key_remapping(from, to);
+                }
+                println!("Loading TTS model tensors...");
+                println!(
+                    "{:?}",
+                    tts.load_from(&mut store)
+                        .expect("couldn't load safetensors tts model")
+                );
+                let tts = cast_module_float_dtype(tts, DType::F16);
+                let mut store =
+                    BurnpackStore::from_file(output_path.join("voxcpm.bpk")).overwrite(true);
+                println!(
+                    "{:?}",
+                    tts.save_into(&mut store)
+                        .expect("couldn't save tts model to burnpack")
+                );
             }
-            println!("Loading TTS model tensors...");
-            println!(
-                "{:?}",
-                tts.load_from(&mut store)
-                    .expect("couldn't load safetensors tts model")
-            );
-            let tts = cast_module_float_dtype(tts, DType::F16);
-            let mut store =
-                BurnpackStore::from_file(output_path.join("voxcpm.bpk")).overwrite(true);
-            println!(
-                "{:?}",
-                tts.save_into(&mut store)
-                    .expect("couldn't save tts model to burnpack")
-            );
         }
     }
 
-    let mut audio_vae: AudioVae<BAud> = tts_config.audio_vae_config.init(&audio_device);
-    let mut store = PytorchStore::from_file(input_path.join("audiovae.pth"))
-        .skip_enum_variants(true)
-        .validate(false)
-        .with_top_level_key("state_dict");
-    println!("Loading Audio VAE tensors...");
-    println!(
-        "{:?}",
-        audio_vae
-            .load_from(&mut store)
-            .expect("couldn't load pytorch audio_vae model")
-    );
+    let is_voxcpm2 = tts_config.architecture.as_deref() == Some("voxcpm2");
+    if is_voxcpm2 {
+        let v2_config: AudioVaeConfigV2 = serde_json::from_value(
+            config_value
+                .get("audio_vae_config")
+                .cloned()
+                .unwrap_or(Value::Object(serde_json::Map::new())),
+        )
+        .expect("couldn't deserialize audio_vae_config as V2");
+        let mut audio_vae: AudioVAEV2<BAud> = v2_config.init(&audio_device);
+        let mut store = PytorchStore::from_file(input_path.join("audiovae.pth"))
+            .skip_enum_variants(true)
+            .validate(false)
+            .with_top_level_key("state_dict");
+        for layer_idx in 2..=7 {
+            // Python stores conditioning modules at decoder layer indices 2..7,
+            // while Rust stores them compactly as sr_cond_layers.0..5.
+            let burn_idx = layer_idx - 2;
+            store = store
+                .with_key_remapping(
+                    format!(r"^decoder\.sr_cond_model\.{layer_idx}\.scale_embed\.weight$"),
+                    format!("decoder.sr_cond_layers.{burn_idx}.scale_weight"),
+                )
+                .with_key_remapping(
+                    format!(r"^decoder\.sr_cond_model\.{layer_idx}\.bias_embed\.weight$"),
+                    format!("decoder.sr_cond_layers.{burn_idx}.bias_weight"),
+                )
+                .with_key_remapping(
+                    format!(r"^decoder\.sr_cond_model\.{layer_idx}\.cond_embed\.weight$"),
+                    format!("decoder.sr_cond_layers.{burn_idx}.cond_weight"),
+                );
+        }
+        println!("Loading Audio VAE V2 tensors...");
+        println!(
+            "{:?}",
+            audio_vae
+                .load_from(&mut store)
+                .expect("couldn't load pytorch audio_vae_v2 model")
+        );
 
-    let mut store = BurnpackStore::from_file(output_path.join("audiovae.bpk")).overwrite(true);
-    println!(
-        "{:?}",
-        audio_vae
-            .save_into(&mut store)
-            .expect("couldn't save audio_vae model to burnpack")
-    );
+        let mut store = BurnpackStore::from_file(output_path.join("audiovae.bpk")).overwrite(true);
+        println!(
+            "{:?}",
+            audio_vae
+                .save_into(&mut store)
+                .expect("couldn't save audio_vae_v2 model to burnpack")
+        );
+    } else {
+        let mut audio_vae: AudioVae<BAud> = tts_config.audio_vae_config.init(&audio_device);
+        let mut store = PytorchStore::from_file(input_path.join("audiovae.pth"))
+            .skip_enum_variants(true)
+            .validate(false)
+            .with_top_level_key("state_dict");
+        println!("Loading Audio VAE tensors...");
+        println!(
+            "{:?}",
+            audio_vae
+                .load_from(&mut store)
+                .expect("couldn't load pytorch audio_vae model")
+        );
+
+        let mut store = BurnpackStore::from_file(output_path.join("audiovae.bpk")).overwrite(true);
+        println!(
+            "{:?}",
+            audio_vae
+                .save_into(&mut store)
+                .expect("couldn't save audio_vae model to burnpack")
+        );
+    }
     std::fs::copy(
         input_path.join("tokenizer.json"),
         output_path.join("tokenizer.json"),

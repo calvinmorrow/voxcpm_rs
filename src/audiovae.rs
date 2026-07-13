@@ -29,7 +29,7 @@ pub struct AudioVaeConfig {
     decoder_rates: Vec<usize>,
     depthwise: Option<bool>,
     #[config(default = 44100)]
-    sample_rate: usize,
+    pub sample_rate: usize,
     use_noise_block: Option<bool>,
 }
 
@@ -91,17 +91,6 @@ impl<B: Backend> AudioVae<B> {
         audio_date.pad((right_pad, 0, 0, 0), PadMode::Constant(0.0))
     }
     pub fn decode(&self, z: Tensor<B, 3>) -> Tensor<B, 3> {
-        // Force f32 at tch level to avoid bf16/f32 mismatch on ROCm
-        let prim = z.into_primitive();
-        let z = match prim {
-            burn::tensor::TensorPrimitive::Float(t) => {
-                let tch_tensor = t.tensor.to_dtype(tch::Kind::Float, true, true);
-                Tensor::from_primitive(burn::tensor::TensorPrimitive::Float(
-                    burn::backend::libtorch::TchTensor::new(tch_tensor),
-                ))
-            }
-            other => Tensor::from_primitive(other),
-        };
         self.decoder.forward(z)
     }
 
@@ -491,11 +480,7 @@ impl<B: Backend> WNCausalTransposeConv1d<B> {
         let weight_v = self.weight_v.val().cast(dtype);
         let weight_g = self.weight_g.val().cast(dtype);
 
-        let v = weight_v.clone()
-            / weight_v
-                .powf_scalar(2.0)
-                .sum_dims(&[2, 1])
-                .sqrt();
+        let v = weight_v.clone() / weight_v.powf_scalar(2.0).sum_dims(&[2, 1]).sqrt();
         let w = weight_g * v;
         let out = conv_transpose1d(
             x,
@@ -592,11 +577,7 @@ impl<B: Backend> WNCausalConv1d<B> {
         let weight_v = self.weight_v.val().cast(dtype);
         let weight_g = self.weight_g.val().cast(dtype);
 
-        let v = weight_v.clone()
-            / weight_v
-                .powf_scalar(2.0)
-                .sum_dims(&[2, 1])
-                .sqrt();
+        let v = weight_v.clone() / weight_v.powf_scalar(2.0).sum_dims(&[2, 1]).sqrt();
 
         let w = weight_g * v;
 
