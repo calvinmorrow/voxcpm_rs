@@ -455,6 +455,17 @@ impl<B: Backend> VoxCPM<B> {
 
         let audio_feat = audio_vae.encode(prompt_audio.unsqueeze(), Some(audio_vae.sample_rate));
 
+        // Truncate time dim to nearest multiple of patch_size for reshape
+        // audio_feat shape: [batch, latent_dim, time]
+        let audio_feat_time = audio_feat.dims()[2];
+        let remainder = audio_feat_time % self.patch_size;
+        let audio_feat = if remainder != 0 {
+            let new_time = audio_feat_time - remainder;
+            audio_feat.slice([s![..], s![..], s![..new_time as i64]])
+        } else {
+            audio_feat
+        };
+
         let audio_feat = audio_feat
             .reshape([audio_vae.latent_dim as i64, -1, self.patch_size as i64])
             .permute([1, 2, 0]);

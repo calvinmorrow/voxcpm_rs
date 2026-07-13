@@ -23,10 +23,12 @@ use clap::Parser;
 use tokio::sync::{Mutex, Semaphore};
 use tokio::time::{Instant as TokioInstant, sleep};
 
+use serde_json::Value;
 use tch::Cuda;
 use voxcpm_rs::audio_utils::{
     decode_wav_bytes, decode_wav_file, encode_pcm_i16, encode_wav_i16, resample_mono_to_48000,
 };
+use voxcpm_rs::audio_vae_v2::{AudioVAEV2, AudioVaeConfigV2};
 use voxcpm_rs::audiovae::AudioVae;
 use voxcpm_rs::openai_error::ApiError;
 use voxcpm_rs::openai_types::{
@@ -115,10 +117,12 @@ enum ModelState {
     Bf16 {
         tts: VoxCPM<backend::LibTorch<bf16>>,
         audio_vae: AudioVae<BAud>,
+        audio_vae_v2: Option<AudioVAEV2<BAud>>,
     },
     F16 {
         tts: VoxCPM<backend::LibTorch<f16>>,
         audio_vae: AudioVae<BAud>,
+        audio_vae_v2: Option<AudioVAEV2<BAud>>,
     },
 }
 
@@ -142,6 +146,7 @@ struct AppState {
     inference_timesteps: Option<usize>,
     disable_chunking: bool,
     semaphore: Arc<Semaphore>,
+    is_voxcpm2: bool,
 }
 
 #[tokio::main]
@@ -167,6 +172,40 @@ async fn main() {
     let tts_config =
         VoxCPMConfig::load(model_path.join("config.json")).expect("failed to load config.json");
 
+    let is_voxcpm2 = tts_config.architecture.as_deref() == Some("voxcpm2");
+    if is_voxcpm2 {
+        println!("Model architecture: voxcpm2 (loading AudioVAEV2)");
+    } else {
+        println!("Model architecture: voxcpm v1 (loading AudioVae)");
+    }
+
+    // For VoxCPM2, re-deserialize audio_vae_config as V2 type from raw JSON
+    let v2_audio_vae_config = if is_voxcpm2 {
+        let raw = std::fs::read_to_string(model_path.join("config.json"))
+            .expect("couldn't read config.json");
+        let json: Value = serde_json::from_str(&raw).expect("invalid config.json");
+        let vae_obj = match json["audio_vae_config"].as_object() {
+            Some(obj) => {
+                let mut map = obj.clone();
+                map.entry("out_sample_rate")
+                    .or_insert_with(|| Value::Number(48000.into()));
+                map.entry("cond_type")
+                    .or_insert_with(|| Value::String("scale_bias".into()));
+                map.entry("cond_dim")
+                    .or_insert_with(|| Value::Number(128.into()));
+                map.entry("cond_out_layer")
+                    .or_insert_with(|| Value::Bool(false));
+                Value::Object(map)
+            }
+            None => Value::Object(serde_json::Map::new()),
+        };
+        let v2_config: AudioVaeConfigV2 =
+            serde_json::from_value(vae_obj).expect("couldn't deserialize audio_vae_config as V2");
+        Some(v2_config)
+    } else {
+        None
+    };
+
     let model = match args.tts_dtype {
         TtsDtype::Bf16 => {
             let mut tts: VoxCPM<backend::LibTorch<bf16>> = tts_config.init(&tts_device);
@@ -174,13 +213,30 @@ async fn main() {
             tts.load_from(&mut store)
                 .expect("failed to load voxcpm.bpk");
 
-            let mut audio_vae: AudioVae<BAud> = tts_config.audio_vae_config.init(&audio_device);
-            let mut store = BurnpackStore::from_file(model_path.join("audiovae.bpk"));
-            audio_vae
-                .load_from(&mut store)
-                .expect("failed to load audiovae.bpk");
+            // For voxcpm2, skip V1 AudioVae loading entirely (weights file is V2 format)
+            let (audio_vae, audio_vae_v2) = if is_voxcpm2 {
+                let mut vae_v2: AudioVAEV2<BAud> = v2_audio_vae_config.unwrap().init(&audio_device);
+                let mut store = BurnpackStore::from_file(model_path.join("audiovae.bpk"));
+                vae_v2
+                    .load_from(&mut store)
+                    .expect("failed to load audiovae.bpk for V2");
+                // V1 AudioVae placeholder (uninitialized, never used for voxcpm2)
+                let audio_vae = tts_config.audio_vae_config.init(&audio_device);
+                (audio_vae, Some(vae_v2))
+            } else {
+                let mut audio_vae: AudioVae<BAud> = tts_config.audio_vae_config.init(&audio_device);
+                let mut store = BurnpackStore::from_file(model_path.join("audiovae.bpk"));
+                audio_vae
+                    .load_from(&mut store)
+                    .expect("failed to load audiovae.bpk");
+                (audio_vae, None)
+            };
 
-            Arc::new(Mutex::new(ModelState::Bf16 { tts, audio_vae }))
+            Arc::new(Mutex::new(ModelState::Bf16 {
+                tts,
+                audio_vae,
+                audio_vae_v2,
+            }))
         }
         TtsDtype::F16 => {
             let mut tts: VoxCPM<backend::LibTorch<f16>> = tts_config.init(&tts_device);
@@ -188,13 +244,29 @@ async fn main() {
             tts.load_from(&mut store)
                 .expect("failed to load voxcpm.bpk");
 
-            let mut audio_vae: AudioVae<BAud> = tts_config.audio_vae_config.init(&audio_device);
-            let mut store = BurnpackStore::from_file(model_path.join("audiovae.bpk"));
-            audio_vae
-                .load_from(&mut store)
-                .expect("failed to load audiovae.bpk");
+            // For voxcpm2, skip V1 AudioVae loading entirely (weights file is V2 format)
+            let (audio_vae, audio_vae_v2) = if is_voxcpm2 {
+                let mut vae_v2: AudioVAEV2<BAud> = v2_audio_vae_config.unwrap().init(&audio_device);
+                let mut store = BurnpackStore::from_file(model_path.join("audiovae.bpk"));
+                vae_v2
+                    .load_from(&mut store)
+                    .expect("failed to load audiovae.bpk for V2");
+                let audio_vae = tts_config.audio_vae_config.init(&audio_device);
+                (audio_vae, Some(vae_v2))
+            } else {
+                let mut audio_vae: AudioVae<BAud> = tts_config.audio_vae_config.init(&audio_device);
+                let mut store = BurnpackStore::from_file(model_path.join("audiovae.bpk"));
+                audio_vae
+                    .load_from(&mut store)
+                    .expect("failed to load audiovae.bpk");
+                (audio_vae, None)
+            };
 
-            Arc::new(Mutex::new(ModelState::F16 { tts, audio_vae }))
+            Arc::new(Mutex::new(ModelState::F16 {
+                tts,
+                audio_vae,
+                audio_vae_v2,
+            }))
         }
     };
 
@@ -211,6 +283,7 @@ async fn main() {
         inference_timesteps: args.inference_timesteps,
         disable_chunking: args.disable_chunking,
         semaphore: Arc::new(Semaphore::new(args.max_concurrency)),
+        is_voxcpm2,
     };
 
     if args.warm_cache {
@@ -282,22 +355,50 @@ async fn warm_prompt_cache(state: &AppState) {
         let cache_entry = {
             let mut model = state.model.lock().await;
             match &mut *model {
-                ModelState::Bf16 { tts, audio_vae } => {
-                    let features = tts.build_prompt_features(
-                        voice.transcript.clone(),
-                        prompt_tensor.clone(),
-                        &*audio_vae,
-                        &state.tts_device,
-                    );
+                ModelState::Bf16 {
+                    tts,
+                    audio_vae,
+                    audio_vae_v2,
+                } => {
+                    let features = if state.is_voxcpm2 {
+                        let vae = audio_vae_v2.as_ref().expect("audio_vae_v2 not loaded");
+                        tts.build_prompt_features_v2(
+                            voice.transcript.clone(),
+                            prompt_tensor.clone(),
+                            vae,
+                            &state.tts_device,
+                        )
+                    } else {
+                        tts.build_prompt_features(
+                            voice.transcript.clone(),
+                            prompt_tensor.clone(),
+                            &*audio_vae,
+                            &state.tts_device,
+                        )
+                    };
                     PromptCacheEntry::Bf16(features)
                 }
-                ModelState::F16 { tts, audio_vae } => {
-                    let features = tts.build_prompt_features(
-                        voice.transcript.clone(),
-                        prompt_tensor.clone(),
-                        &*audio_vae,
-                        &state.tts_device,
-                    );
+                ModelState::F16 {
+                    tts,
+                    audio_vae,
+                    audio_vae_v2,
+                } => {
+                    let features = if state.is_voxcpm2 {
+                        let vae = audio_vae_v2.as_ref().expect("audio_vae_v2 not loaded");
+                        tts.build_prompt_features_v2(
+                            voice.transcript.clone(),
+                            prompt_tensor.clone(),
+                            vae,
+                            &state.tts_device,
+                        )
+                    } else {
+                        tts.build_prompt_features(
+                            voice.transcript.clone(),
+                            prompt_tensor.clone(),
+                            &*audio_vae,
+                            &state.tts_device,
+                        )
+                    };
                     PromptCacheEntry::F16(features)
                 }
             }
@@ -537,7 +638,11 @@ async fn handle_speech(
     let mut cache_insert: Option<PromptCacheEntry> = None;
     let mut model = state.model.lock().await;
     let (wav, sample_rate) = match &mut *model {
-        ModelState::Bf16 { tts, audio_vae } => {
+        ModelState::Bf16 {
+            tts,
+            audio_vae,
+            audio_vae_v2,
+        } => {
             let prompt_features = match &cached_entry {
                 Some(PromptCacheEntry::Bf16(features)) => {
                     println!("prompt_cache: hit voice_id={}", voice.voice_id);
@@ -546,29 +651,59 @@ async fn handle_speech(
                 _ => {
                     println!("prompt_cache: miss voice_id={}", voice.voice_id);
                     let prompt_tensor = load_prompt_tensor(&state, &voice)?;
-                    let features = tts.build_prompt_features(
-                        voice.transcript.clone(),
-                        prompt_tensor,
-                        &*audio_vae,
-                        &state.tts_device,
-                    );
+                    let features = if state.is_voxcpm2 {
+                        let vae = audio_vae_v2.as_ref().expect("audio_vae_v2 not loaded");
+                        tts.build_prompt_features_v2(
+                            voice.transcript.clone(),
+                            prompt_tensor,
+                            vae,
+                            &state.tts_device,
+                        )
+                    } else {
+                        tts.build_prompt_features(
+                            voice.transcript.clone(),
+                            prompt_tensor,
+                            &*audio_vae,
+                            &state.tts_device,
+                        )
+                    };
                     cache_insert = Some(PromptCacheEntry::Bf16(features.clone()));
                     features
                 }
             };
-            let wav = generate_chunked_bf16(
-                tts,
-                &chunks,
-                &prompt_features,
-                &state.tokenizer_path,
-                state.inference_timesteps,
-                &*audio_vae,
-                &state.tts_device,
-                &state.audio_device,
-            )?;
-            Ok((wav, audio_vae.sample_rate as u32))
+            let (wav, sr) = if state.is_voxcpm2 {
+                let vae = audio_vae_v2.as_ref().expect("audio_vae_v2 not loaded");
+                let wav = generate_chunked_bf16_v2(
+                    tts,
+                    &chunks,
+                    &prompt_features,
+                    &state.tokenizer_path,
+                    state.inference_timesteps,
+                    vae,
+                    &state.tts_device,
+                    &state.audio_device,
+                )?;
+                (wav, vae.out_sample_rate as u32)
+            } else {
+                let wav = generate_chunked_bf16(
+                    tts,
+                    &chunks,
+                    &prompt_features,
+                    &state.tokenizer_path,
+                    state.inference_timesteps,
+                    &*audio_vae,
+                    &state.tts_device,
+                    &state.audio_device,
+                )?;
+                (wav, audio_vae.sample_rate as u32)
+            };
+            Ok((wav, sr))
         }
-        ModelState::F16 { tts, audio_vae } => {
+        ModelState::F16 {
+            tts,
+            audio_vae,
+            audio_vae_v2,
+        } => {
             let prompt_features = match &cached_entry {
                 Some(PromptCacheEntry::F16(features)) => {
                     println!("prompt_cache: hit voice_id={}", voice.voice_id);
@@ -577,27 +712,53 @@ async fn handle_speech(
                 _ => {
                     println!("prompt_cache: miss voice_id={}", voice.voice_id);
                     let prompt_tensor = load_prompt_tensor(&state, &voice)?;
-                    let features = tts.build_prompt_features(
-                        voice.transcript.clone(),
-                        prompt_tensor,
-                        &*audio_vae,
-                        &state.tts_device,
-                    );
+                    let features = if state.is_voxcpm2 {
+                        let vae = audio_vae_v2.as_ref().expect("audio_vae_v2 not loaded");
+                        tts.build_prompt_features_v2(
+                            voice.transcript.clone(),
+                            prompt_tensor,
+                            vae,
+                            &state.tts_device,
+                        )
+                    } else {
+                        tts.build_prompt_features(
+                            voice.transcript.clone(),
+                            prompt_tensor,
+                            &*audio_vae,
+                            &state.tts_device,
+                        )
+                    };
                     cache_insert = Some(PromptCacheEntry::F16(features.clone()));
                     features
                 }
             };
-            let wav = generate_chunked_f16(
-                tts,
-                &chunks,
-                &prompt_features,
-                &state.tokenizer_path,
-                state.inference_timesteps,
-                &*audio_vae,
-                &state.tts_device,
-                &state.audio_device,
-            )?;
-            Ok((wav, audio_vae.sample_rate as u32))
+            let (wav, sr) = if state.is_voxcpm2 {
+                let vae = audio_vae_v2.as_ref().expect("audio_vae_v2 not loaded");
+                let wav = generate_chunked_f16_v2(
+                    tts,
+                    &chunks,
+                    &prompt_features,
+                    &state.tokenizer_path,
+                    state.inference_timesteps,
+                    vae,
+                    &state.tts_device,
+                    &state.audio_device,
+                )?;
+                (wav, vae.out_sample_rate as u32)
+            } else {
+                let wav = generate_chunked_f16(
+                    tts,
+                    &chunks,
+                    &prompt_features,
+                    &state.tokenizer_path,
+                    state.inference_timesteps,
+                    &*audio_vae,
+                    &state.tts_device,
+                    &state.audio_device,
+                )?;
+                (wav, audio_vae.sample_rate as u32)
+            };
+            Ok((wav, sr))
         }
     }?;
     if let Some(entry) = cache_insert {
@@ -726,6 +887,94 @@ fn generate_chunked_f16(
         outputs.push(samples);
     }
     let sample_rate = audio_vae.sample_rate as u32;
+    Ok(crossfade_concat(outputs, sample_rate, 0.02))
+}
+
+fn generate_chunked_bf16_v2(
+    tts: &mut VoxCPM<BTtsBf16>,
+    chunks: &[String],
+    prompt_features: &PromptFeatures<BTtsBf16>,
+    tokenizer_path: &Path,
+    inference_timesteps: Option<usize>,
+    audio_vae_v2: &AudioVAEV2<BAud>,
+    tts_device: &LibTorchDevice,
+    audio_device: &<BAud as BackendTypes>::Device,
+) -> Result<Vec<f32>, ApiError> {
+    let mut outputs: Vec<Vec<f32>> = Vec::with_capacity(chunks.len());
+    for chunk in chunks {
+        let chunk = chunk.trim();
+        if chunk.is_empty() {
+            continue;
+        }
+        let wav = tts.generate_libtorch_with_prompt_features_v2(
+            chunk,
+            Some(prompt_features),
+            tokenizer_path,
+            None,
+            None,
+            inference_timesteps,
+            None,
+            false,
+            3,
+            6.0,
+            false,
+            false,
+            audio_vae_v2,
+            tts_device,
+            audio_device,
+        );
+        let samples: Vec<f32> = wav
+            .cast(DType::F32)
+            .to_data()
+            .to_vec()
+            .map_err(|_| ApiError::server_error("failed to convert wav tensor"))?;
+        outputs.push(samples);
+    }
+    let sample_rate = audio_vae_v2.out_sample_rate as u32;
+    Ok(crossfade_concat(outputs, sample_rate, 0.02))
+}
+
+fn generate_chunked_f16_v2(
+    tts: &mut VoxCPM<BTtsF16>,
+    chunks: &[String],
+    prompt_features: &PromptFeatures<BTtsF16>,
+    tokenizer_path: &Path,
+    inference_timesteps: Option<usize>,
+    audio_vae_v2: &AudioVAEV2<BAud>,
+    tts_device: &LibTorchDevice,
+    audio_device: &<BAud as BackendTypes>::Device,
+) -> Result<Vec<f32>, ApiError> {
+    let mut outputs: Vec<Vec<f32>> = Vec::with_capacity(chunks.len());
+    for chunk in chunks {
+        let chunk = chunk.trim();
+        if chunk.is_empty() {
+            continue;
+        }
+        let wav = tts.generate_libtorch_with_prompt_features_v2(
+            chunk,
+            Some(prompt_features),
+            tokenizer_path,
+            None,
+            None,
+            inference_timesteps,
+            None,
+            false,
+            3,
+            6.0,
+            false,
+            false,
+            audio_vae_v2,
+            tts_device,
+            audio_device,
+        );
+        let samples: Vec<f32> = wav
+            .cast(DType::F32)
+            .to_data()
+            .to_vec()
+            .map_err(|_| ApiError::server_error("failed to convert wav tensor"))?;
+        outputs.push(samples);
+    }
+    let sample_rate = audio_vae_v2.out_sample_rate as u32;
     Ok(crossfade_concat(outputs, sample_rate, 0.02))
 }
 
@@ -872,8 +1121,34 @@ fn stream_wav_response(
         let sample_rate = {
             let model = state.model.lock().await;
             match &*model {
-                ModelState::Bf16 { audio_vae, .. } => audio_vae.sample_rate as u32,
-                ModelState::F16 { audio_vae, .. } => audio_vae.sample_rate as u32,
+                ModelState::Bf16 {
+                    audio_vae,
+                    audio_vae_v2,
+                    ..
+                } => {
+                    if state.is_voxcpm2 {
+                        audio_vae_v2
+                            .as_ref()
+                            .map(|v| v.out_sample_rate)
+                            .unwrap_or(audio_vae.sample_rate) as u32
+                    } else {
+                        audio_vae.sample_rate as u32
+                    }
+                }
+                ModelState::F16 {
+                    audio_vae,
+                    audio_vae_v2,
+                    ..
+                } => {
+                    if state.is_voxcpm2 {
+                        audio_vae_v2
+                            .as_ref()
+                            .map(|v| v.out_sample_rate)
+                            .unwrap_or(audio_vae.sample_rate) as u32
+                    } else {
+                        audio_vae.sample_rate as u32
+                    }
+                }
             }
         };
         let header = wav_header_unknown_length(sample_rate, 1, 16);
@@ -931,15 +1206,30 @@ async fn stream_chunks_bf16(
             println!("prompt_cache: miss voice_id={}", voice.voice_id);
             let prompt_tensor = load_prompt_tensor(&state, &voice)?;
             let mut model = state.model.lock().await;
-            let ModelState::Bf16 { tts, audio_vae } = &mut *model else {
+            let ModelState::Bf16 {
+                tts,
+                audio_vae,
+                audio_vae_v2,
+            } = &mut *model
+            else {
                 return Err(ApiError::server_error("model dtype changed"));
             };
-            let features = tts.build_prompt_features(
-                voice.transcript.clone(),
-                prompt_tensor,
-                &*audio_vae,
-                &state.tts_device,
-            );
+            let features = if state.is_voxcpm2 {
+                let vae = audio_vae_v2.as_ref().expect("audio_vae_v2 not loaded");
+                tts.build_prompt_features_v2(
+                    voice.transcript.clone(),
+                    prompt_tensor,
+                    vae,
+                    &state.tts_device,
+                )
+            } else {
+                tts.build_prompt_features(
+                    voice.transcript.clone(),
+                    prompt_tensor,
+                    &*audio_vae,
+                    &state.tts_device,
+                )
+            };
             state.prompt_cache.lock().await.insert(
                 voice.voice_id.clone(),
                 PromptCacheEntry::Bf16(features.clone()),
@@ -969,15 +1259,30 @@ async fn stream_chunks_f16(
             println!("prompt_cache: miss voice_id={}", voice.voice_id);
             let prompt_tensor = load_prompt_tensor(&state, &voice)?;
             let mut model = state.model.lock().await;
-            let ModelState::F16 { tts, audio_vae } = &mut *model else {
+            let ModelState::F16 {
+                tts,
+                audio_vae,
+                audio_vae_v2,
+            } = &mut *model
+            else {
                 return Err(ApiError::server_error("model dtype changed"));
             };
-            let features = tts.build_prompt_features(
-                voice.transcript.clone(),
-                prompt_tensor,
-                &*audio_vae,
-                &state.tts_device,
-            );
+            let features = if state.is_voxcpm2 {
+                let vae = audio_vae_v2.as_ref().expect("audio_vae_v2 not loaded");
+                tts.build_prompt_features_v2(
+                    voice.transcript.clone(),
+                    prompt_tensor,
+                    vae,
+                    &state.tts_device,
+                )
+            } else {
+                tts.build_prompt_features(
+                    voice.transcript.clone(),
+                    prompt_tensor,
+                    &*audio_vae,
+                    &state.tts_device,
+                )
+            };
             state.prompt_cache.lock().await.insert(
                 voice.voice_id.clone(),
                 PromptCacheEntry::F16(features.clone()),
@@ -1010,26 +1315,52 @@ async fn stream_chunks_bf16_with_features(
         let (samples, gen_elapsed) = {
             let gen_start = Instant::now();
             let mut model = state.model.lock().await;
-            let ModelState::Bf16 { tts, audio_vae } = &mut *model else {
+            let ModelState::Bf16 {
+                tts,
+                audio_vae,
+                audio_vae_v2,
+            } = &mut *model
+            else {
                 return Err(ApiError::server_error("model dtype changed"));
             };
-            let wav = tts.generate_libtorch_with_prompt_features(
-                chunk,
-                Some(&prompt_features),
-                &state.tokenizer_path,
-                None,
-                None,
-                state.inference_timesteps,
-                None,
-                false,
-                3,
-                6.0,
-                false,
-                false,
-                &*audio_vae,
-                &state.tts_device,
-                &state.audio_device,
-            );
+            let wav = if state.is_voxcpm2 {
+                let vae = audio_vae_v2.as_ref().expect("audio_vae_v2 not loaded");
+                tts.generate_libtorch_with_prompt_features_v2(
+                    chunk,
+                    Some(&prompt_features),
+                    &state.tokenizer_path,
+                    None,
+                    None,
+                    state.inference_timesteps,
+                    None,
+                    false,
+                    3,
+                    6.0,
+                    false,
+                    false,
+                    vae,
+                    &state.tts_device,
+                    &state.audio_device,
+                )
+            } else {
+                tts.generate_libtorch_with_prompt_features(
+                    chunk,
+                    Some(&prompt_features),
+                    &state.tokenizer_path,
+                    None,
+                    None,
+                    state.inference_timesteps,
+                    None,
+                    false,
+                    3,
+                    6.0,
+                    false,
+                    false,
+                    &*audio_vae,
+                    &state.tts_device,
+                    &state.audio_device,
+                )
+            };
             let samples = wav
                 .cast(DType::F32)
                 .to_data()
@@ -1083,26 +1414,52 @@ async fn stream_chunks_f16_with_features(
         let (samples, gen_elapsed) = {
             let gen_start = Instant::now();
             let mut model = state.model.lock().await;
-            let ModelState::F16 { tts, audio_vae } = &mut *model else {
+            let ModelState::F16 {
+                tts,
+                audio_vae,
+                audio_vae_v2,
+            } = &mut *model
+            else {
                 return Err(ApiError::server_error("model dtype changed"));
             };
-            let wav = tts.generate_libtorch_with_prompt_features(
-                chunk,
-                Some(&prompt_features),
-                &state.tokenizer_path,
-                None,
-                None,
-                state.inference_timesteps,
-                None,
-                false,
-                3,
-                6.0,
-                false,
-                false,
-                &*audio_vae,
-                &state.tts_device,
-                &state.audio_device,
-            );
+            let wav = if state.is_voxcpm2 {
+                let vae = audio_vae_v2.as_ref().expect("audio_vae_v2 not loaded");
+                tts.generate_libtorch_with_prompt_features_v2(
+                    chunk,
+                    Some(&prompt_features),
+                    &state.tokenizer_path,
+                    None,
+                    None,
+                    state.inference_timesteps,
+                    None,
+                    false,
+                    3,
+                    6.0,
+                    false,
+                    false,
+                    vae,
+                    &state.tts_device,
+                    &state.audio_device,
+                )
+            } else {
+                tts.generate_libtorch_with_prompt_features(
+                    chunk,
+                    Some(&prompt_features),
+                    &state.tokenizer_path,
+                    None,
+                    None,
+                    state.inference_timesteps,
+                    None,
+                    false,
+                    3,
+                    6.0,
+                    false,
+                    false,
+                    &*audio_vae,
+                    &state.tts_device,
+                    &state.audio_device,
+                )
+            };
             let samples = wav
                 .cast(DType::F32)
                 .to_data()
